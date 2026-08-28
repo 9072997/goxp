@@ -474,6 +474,17 @@ func CancelIo(s Handle) (err error) {
 }
 
 func CancelIoEx(s Handle, o *Overlapped) (err error) {
+	// Not present before Windows Vista. LazyProc.Addr panics on a missing
+	// entry point, so take an XP-compatible path instead.
+	if procCancelIoEx.Find() != nil {
+		// CancelIo only cancels operations issued by the calling thread, so
+		// it may cancel nothing. Report ERROR_NOT_FOUND in that case, which
+		// callers already treat as "the request was no longer pending".
+		if err := CancelIo(s); err != nil {
+			return ERROR_NOT_FOUND
+		}
+		return nil
+	}
 	r1, _, e1 := SyscallN(procCancelIoEx.Addr(), uintptr(s), uintptr(unsafe.Pointer(o)))
 	if r1 == 0 {
 		err = errnoErr(e1)
@@ -553,6 +564,11 @@ func CreateProcess(appName *uint16, commandLine *uint16, procSecurity *SecurityA
 }
 
 func CreateSymbolicLink(symlinkfilename *uint16, targetfilename *uint16, flags uint32) (err error) {
+	// Not present before Windows Vista. LazyProc.Addr panics on a missing
+	// entry point, so take an XP-compatible path instead.
+	if procCreateSymbolicLinkW.Find() != nil {
+		return _ERROR_NOT_SUPPORTED
+	}
 	r1, _, e1 := SyscallN(procCreateSymbolicLinkW.Addr(), uintptr(unsafe.Pointer(symlinkfilename)), uintptr(unsafe.Pointer(targetfilename)), uintptr(flags))
 	if r1&0xff == 0 {
 		err = errnoErr(e1)
@@ -578,6 +594,11 @@ func DeleteFile(path *uint16) (err error) {
 }
 
 func deleteProcThreadAttributeList(attrlist *_PROC_THREAD_ATTRIBUTE_LIST) {
+	// Not present before Windows Vista. LazyProc.Addr panics on a missing
+	// entry point, so take an XP-compatible path instead.
+	if procDeleteProcThreadAttributeList.Find() != nil {
+		return
+	}
 	SyscallN(procDeleteProcThreadAttributeList.Addr(), uintptr(unsafe.Pointer(attrlist)))
 	return
 }
@@ -784,6 +805,11 @@ func GetFileType(filehandle Handle) (n uint32, err error) {
 }
 
 func getFinalPathNameByHandle(file Handle, filePath *uint16, filePathSize uint32, flags uint32) (n uint32, err error) {
+	// Not present before Windows Vista. LazyProc.Addr panics on a missing
+	// entry point, so take an XP-compatible path instead.
+	if procGetFinalPathNameByHandleW.Find() != nil {
+		return 0, _ERROR_NOT_SUPPORTED
+	}
 	r0, _, e1 := SyscallN(procGetFinalPathNameByHandleW.Addr(), uintptr(file), uintptr(unsafe.Pointer(filePath)), uintptr(filePathSize), uintptr(flags))
 	n = uint32(r0)
 	if n == 0 || n >= filePathSize {
@@ -917,6 +943,11 @@ func GetVersion() (ver uint32, err error) {
 }
 
 func initializeProcThreadAttributeList(attrlist *_PROC_THREAD_ATTRIBUTE_LIST, attrcount uint32, flags uint32, size *uintptr) (err error) {
+	// Not present before Windows Vista. LazyProc.Addr panics on a missing
+	// entry point, so take an XP-compatible path instead.
+	if procInitializeProcThreadAttributeList.Find() != nil {
+		return _ERROR_NOT_SUPPORTED
+	}
 	r1, _, e1 := SyscallN(procInitializeProcThreadAttributeList.Addr(), uintptr(unsafe.Pointer(attrlist)), uintptr(attrcount), uintptr(flags), uintptr(unsafe.Pointer(size)))
 	if r1 == 0 {
 		err = errnoErr(e1)
@@ -1087,6 +1118,10 @@ func SetFileAttributes(name *uint16, attrs uint32) (err error) {
 }
 
 func SetFileCompletionNotificationModes(handle Handle, flags uint8) (err error) {
+	// Not present before Windows XP SP2.
+	if procSetFileCompletionNotificationModes.Find() != nil {
+		return _ERROR_NOT_SUPPORTED
+	}
 	r1, _, e1 := SyscallN(procSetFileCompletionNotificationModes.Addr(), uintptr(handle), uintptr(flags))
 	if r1 == 0 {
 		err = errnoErr(e1)
@@ -1095,6 +1130,11 @@ func SetFileCompletionNotificationModes(handle Handle, flags uint8) (err error) 
 }
 
 func setFileInformationByHandle(handle Handle, fileInformationClass uint32, buf unsafe.Pointer, bufsize uint32) (err error) {
+	// Not present before Windows Vista. LazyProc.Addr panics on a missing
+	// entry point, so take an XP-compatible path instead.
+	if procSetFileInformationByHandle.Find() != nil {
+		return _ERROR_NOT_SUPPORTED
+	}
 	r1, _, e1 := SyscallN(procSetFileInformationByHandle.Addr(), uintptr(handle), uintptr(fileInformationClass), uintptr(buf), uintptr(bufsize))
 	if r1 == 0 {
 		err = errnoErr(e1)
@@ -1144,6 +1184,11 @@ func UnmapViewOfFile(addr uintptr) (err error) {
 }
 
 func updateProcThreadAttribute(attrlist *_PROC_THREAD_ATTRIBUTE_LIST, flags uint32, attr uintptr, value unsafe.Pointer, size uintptr, prevvalue unsafe.Pointer, returnedsize *uintptr) (err error) {
+	// Not present before Windows Vista. LazyProc.Addr panics on a missing
+	// entry point, so take an XP-compatible path instead.
+	if procUpdateProcThreadAttribute.Find() != nil {
+		return _ERROR_NOT_SUPPORTED
+	}
 	r1, _, e1 := SyscallN(procUpdateProcThreadAttribute.Addr(), uintptr(unsafe.Pointer(attrlist)), uintptr(flags), uintptr(attr), uintptr(value), uintptr(size), uintptr(prevvalue), uintptr(unsafe.Pointer(returnedsize)))
 	if r1 == 0 {
 		err = errnoErr(e1)

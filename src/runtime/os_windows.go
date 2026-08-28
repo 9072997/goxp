@@ -24,17 +24,15 @@ const (
 //go:cgo_import_dynamic runtime._CreateIoCompletionPort CreateIoCompletionPort%4 "kernel32.dll"
 //go:cgo_import_dynamic runtime._CreateThread CreateThread%6 "kernel32.dll"
 //go:cgo_import_dynamic runtime._CreateWaitableTimerA CreateWaitableTimerA%3 "kernel32.dll"
-//go:cgo_import_dynamic runtime._CreateWaitableTimerExW CreateWaitableTimerExW%4 "kernel32.dll"
 //go:cgo_import_dynamic runtime._DuplicateHandle DuplicateHandle%7 "kernel32.dll"
 //go:cgo_import_dynamic runtime._ExitProcess ExitProcess%1 "kernel32.dll"
 //go:cgo_import_dynamic runtime._FreeEnvironmentStringsW FreeEnvironmentStringsW%1 "kernel32.dll"
 //go:cgo_import_dynamic runtime._GetConsoleMode GetConsoleMode%2 "kernel32.dll"
 //go:cgo_import_dynamic runtime._GetCurrentThreadId GetCurrentThreadId%0 "kernel32.dll"
 //go:cgo_import_dynamic runtime._GetEnvironmentStringsW GetEnvironmentStringsW%0 "kernel32.dll"
-//go:cgo_import_dynamic runtime._GetErrorMode GetErrorMode%0 "kernel32.dll"
 //go:cgo_import_dynamic runtime._GetProcAddress GetProcAddress%2 "kernel32.dll"
 //go:cgo_import_dynamic runtime._GetProcessAffinityMask GetProcessAffinityMask%3 "kernel32.dll"
-//go:cgo_import_dynamic runtime._GetQueuedCompletionStatusEx GetQueuedCompletionStatusEx%6 "kernel32.dll"
+//go:cgo_import_dynamic runtime._GetQueuedCompletionStatus GetQueuedCompletionStatus%5 "kernel32.dll"
 //go:cgo_import_dynamic runtime._GetStdHandle GetStdHandle%1 "kernel32.dll"
 //go:cgo_import_dynamic runtime._GetSystemDirectoryA GetSystemDirectoryA%2 "kernel32.dll"
 //go:cgo_import_dynamic runtime._GetSystemInfo GetSystemInfo%1 "kernel32.dll"
@@ -46,7 +44,6 @@ const (
 //go:cgo_import_dynamic runtime._PostQueuedCompletionStatus PostQueuedCompletionStatus%4 "kernel32.dll"
 //go:cgo_import_dynamic runtime._QueryPerformanceCounter QueryPerformanceCounter%1 "kernel32.dll"
 //go:cgo_import_dynamic runtime._QueryPerformanceFrequency QueryPerformanceFrequency%1 "kernel32.dll"
-//go:cgo_import_dynamic runtime._RaiseFailFastException RaiseFailFastException%3 "kernel32.dll"
 //go:cgo_import_dynamic runtime._ResumeThread ResumeThread%1 "kernel32.dll"
 //go:cgo_import_dynamic runtime._RtlLookupFunctionEntry RtlLookupFunctionEntry%3 "kernel32.dll"
 //go:cgo_import_dynamic runtime._RtlVirtualUnwind  RtlVirtualUnwind%8 "kernel32.dll"
@@ -65,8 +62,6 @@ const (
 //go:cgo_import_dynamic runtime._VirtualQuery VirtualQuery%3 "kernel32.dll"
 //go:cgo_import_dynamic runtime._WaitForSingleObject WaitForSingleObject%2 "kernel32.dll"
 //go:cgo_import_dynamic runtime._WaitForMultipleObjects WaitForMultipleObjects%4 "kernel32.dll"
-//go:cgo_import_dynamic runtime._WerGetFlags WerGetFlags%2 "kernel32.dll"
-//go:cgo_import_dynamic runtime._WerSetFlags WerSetFlags%1 "kernel32.dll"
 //go:cgo_import_dynamic runtime._WriteConsoleW WriteConsoleW%5 "kernel32.dll"
 //go:cgo_import_dynamic runtime._WriteFile WriteFile%5 "kernel32.dll"
 
@@ -94,6 +89,7 @@ var (
 	_GetErrorMode,
 	_GetProcAddress,
 	_GetProcessAffinityMask,
+	_GetQueuedCompletionStatus,
 	_GetQueuedCompletionStatusEx,
 	_GetStdHandle,
 	_GetSystemDirectoryA,
@@ -318,6 +314,17 @@ func loadOptionalSyscalls() {
 	_LoadLibraryExW = windowsFindfunc(k32, []byte("LoadLibraryExW\000"))
 	useLoadLibraryEx = (_LoadLibraryExW != nil && _AddDllDirectory != nil)
 
+	// Windows XP / Server 2003 lack the following kernel32 entry points, which
+	// arrived in Vista. They are looked up dynamically rather than named in the
+	// PE import table so that the image still loads on XP; every call site
+	// checks for nil and takes an XP-compatible path.
+	_CreateWaitableTimerExW = windowsFindfunc(k32, []byte("CreateWaitableTimerExW\000"))
+	_GetErrorMode = windowsFindfunc(k32, []byte("GetErrorMode\000"))
+	_GetQueuedCompletionStatusEx = windowsFindfunc(k32, []byte("GetQueuedCompletionStatusEx\000"))
+	_RaiseFailFastException = windowsFindfunc(k32, []byte("RaiseFailFastException\000"))
+	_WerGetFlags = windowsFindfunc(k32, []byte("WerGetFlags\000"))
+	_WerSetFlags = windowsFindfunc(k32, []byte("WerSetFlags\000"))
+
 	a32 := windowsLoadSystemLib(advapi32dll[:])
 	if a32 == 0 {
 		throw("advapi32.dll not found")
@@ -459,6 +466,10 @@ var haveHighResSleep = false
 // resolution timer. createHighResTimer returns new timer
 // handle or 0, if CreateWaitableTimerEx failed.
 func createHighResTimer() uintptr {
+	if _CreateWaitableTimerExW == nil {
+		// Windows XP: no high resolution timer available.
+		return 0
+	}
 	// As per @jstarks, see
 	// https://github.com/golang/go/issues/8687#issuecomment-656259353
 	return stdcall(_CreateWaitableTimerExW, 0, 0,

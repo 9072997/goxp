@@ -282,8 +282,8 @@ type IMAGE_LOAD_CONFIG_DIRECTORY64 struct {
 }
 
 const (
-	// Windows 7 / Server 2008 R2 (NT 6.1).
-	PeMinimumTargetMajorVersion = 6
+	// Windows XP / Server 2003 (NT 5.1).
+	PeMinimumTargetMajorVersion = 5
 	PeMinimumTargetMinorVersion = 1
 )
 

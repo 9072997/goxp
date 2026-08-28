@@ -194,14 +194,47 @@ func netpoll(delay int64) (gList, int32) {
 	if delay != 0 {
 		mp.blocked = true
 	}
-	if stdcall(_GetQueuedCompletionStatusEx, iocphandle, uintptr(unsafe.Pointer(&entries[0])), uintptr(n), uintptr(unsafe.Pointer(&n)), uintptr(wait), 0) == 0 {
-		mp.blocked = false
-		errno := getlasterror()
-		if errno == windows.WAIT_TIMEOUT {
-			return gList{}, 0
+	if _GetQueuedCompletionStatusEx != nil {
+		if stdcall(_GetQueuedCompletionStatusEx, iocphandle, uintptr(unsafe.Pointer(&entries[0])), uintptr(n), uintptr(unsafe.Pointer(&n)), uintptr(wait), 0) == 0 {
+			mp.blocked = false
+			errno := getlasterror()
+			if errno == windows.WAIT_TIMEOUT {
+				return gList{}, 0
+			}
+			println("runtime: GetQueuedCompletionStatusEx failed (errno=", errno, ")")
+			throw("runtime: netpoll failed")
 		}
-		println("runtime: GetQueuedCompletionStatusEx failed (errno=", errno, ")")
-		throw("runtime: netpoll failed")
+	} else {
+		// Windows XP has no GetQueuedCompletionStatusEx; it arrived in Vista.
+		// The singular call returns one completion at a time and hands back
+		// the same completion key and OVERLAPPED pointer that the Ex call
+		// writes into an overlappedEntry, so fill one entry and let the loop
+		// below run unchanged.
+		//
+		// The loop never reads entry.qty - bytes transferred reach
+		// internal/poll through the OVERLAPPED itself - so the count this
+		// call reports separately is recorded and not otherwise needed.
+		var qty uint32
+		var key uintptr
+		var ov *windows.Overlapped
+		if stdcall(_GetQueuedCompletionStatus, iocphandle, uintptr(unsafe.Pointer(&qty)), uintptr(unsafe.Pointer(&key)), uintptr(unsafe.Pointer(&ov)), uintptr(wait)) == 0 {
+			mp.blocked = false
+			errno := getlasterror()
+			if errno == windows.WAIT_TIMEOUT {
+				return gList{}, 0
+			}
+			if ov == nil {
+				println("runtime: GetQueuedCompletionStatus failed (errno=", errno, ")")
+				throw("runtime: netpoll failed")
+			}
+			// A completion packet for a failed I/O was dequeued. That is a
+			// result rather than a poller failure: the error travels in the
+			// OVERLAPPED and internal/poll reads it there, exactly as it
+			// does for a failure reported through the Ex call. Fall through
+			// and hand the entry to the loop.
+		}
+		entries[0] = overlappedEntry{key: key, ov: ov, qty: qty}
+		n = 1
 	}
 	mp.blocked = false
 	delta := int32(0)

@@ -11,6 +11,12 @@ import (
 )
 
 func preventErrorDialogs() {
+	if _GetErrorMode == nil {
+		// Windows XP: GetErrorMode arrived in Vista. SetErrorMode is
+		// available, so set the flags without preserving the existing ones.
+		stdcall(_SetErrorMode, windows.SEM_FAILCRITICALERRORS|windows.SEM_NOGPFAULTERRORBOX|windows.SEM_NOOPENFILEERRORBOX)
+		return
+	}
 	errormode := stdcall(_GetErrorMode)
 	stdcall(_SetErrorMode, errormode|windows.SEM_FAILCRITICALERRORS|windows.SEM_NOGPFAULTERRORBOX|windows.SEM_NOOPENFILEERRORBOX)
 
@@ -18,6 +24,10 @@ func preventErrorDialogs() {
 	// Do this even if WER is disabled as a whole,
 	// as WER might be enabled later with setTraceback("wer")
 	// and we still want the fault reporting UI to be disabled if this happens.
+	if _WerGetFlags == nil || _WerSetFlags == nil {
+		// Windows XP predates Windows Error Reporting; nothing to disable.
+		return
+	}
 	var werflags uintptr
 	stdcall(_WerGetFlags, windows.CurrentProcess, uintptr(unsafe.Pointer(&werflags)))
 	stdcall(_WerSetFlags, werflags|windows.WER_FAULT_REPORTING_NO_UI)
@@ -25,6 +35,10 @@ func preventErrorDialogs() {
 
 // enableWER re-enables Windows error reporting without fault reporting UI.
 func enableWER() {
+	if _GetErrorMode == nil {
+		// Windows XP: no GetErrorMode, and no WER to re-enable.
+		return
+	}
 	// re-enable Windows Error Reporting
 	errormode := stdcall(_GetErrorMode)
 	if errormode&windows.SEM_NOGPFAULTERRORBOX != 0 {
@@ -438,6 +452,11 @@ func crash() {
 //
 //go:nosplit
 func dieFromException(info *windows.ExceptionRecord, r *windows.Context) {
+	if _RaiseFailFastException == nil {
+		// Windows XP: RaiseFailFastException arrived in Vista. Fall back to
+		// the runtime's own abort, which raises an unrecoverable exception.
+		throw("runtime: unhandled exception (no RaiseFailFastException)")
+	}
 	if info == nil {
 		gp := getg()
 		if gp.sig != 0 {

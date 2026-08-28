@@ -348,6 +348,11 @@ func GetCurrentThread() (pseudoHandle syscall.Handle, err error) {
 }
 
 func GetFileInformationByHandleEx(handle syscall.Handle, class uint32, info *byte, bufsize uint32) (err error) {
+	// Not present before Windows Vista. LazyProc.Addr panics on a missing
+	// entry point, so report it as an unsupported operation instead.
+	if procGetFileInformationByHandleEx.Find() != nil {
+		return ERROR_NOT_SUPPORTED
+	}
 	r1, _, e1 := syscall.SyscallN(procGetFileInformationByHandleEx.Addr(), uintptr(handle), uintptr(class), uintptr(unsafe.Pointer(info)), uintptr(bufsize))
 	if r1 == 0 {
 		err = errnoErr(e1)
@@ -364,6 +369,11 @@ func GetFileSizeEx(handle syscall.Handle, size *int64) (err error) {
 }
 
 func GetFinalPathNameByHandle(file syscall.Handle, filePath *uint16, filePathSize uint32, flags uint32) (n uint32, err error) {
+	// Not present before Windows Vista. LazyProc.Addr panics on a missing
+	// entry point, so report it as an unsupported operation instead.
+	if procGetFinalPathNameByHandleW.Find() != nil {
+		return 0, ERROR_NOT_SUPPORTED
+	}
 	r0, _, e1 := syscall.SyscallN(procGetFinalPathNameByHandleW.Addr(), uintptr(file), uintptr(unsafe.Pointer(filePath)), uintptr(filePathSize), uintptr(flags))
 	n = uint32(r0)
 	if n == 0 {
@@ -403,6 +413,11 @@ func GetOverlappedResult(handle syscall.Handle, overlapped *syscall.Overlapped, 
 }
 
 func GetTempPath2(buflen uint32, buf *uint16) (n uint32, err error) {
+	// Not present before Windows Vista. LazyProc.Addr panics on a missing
+	// entry point, so report it as an unsupported operation instead.
+	if procGetTempPath2W.Find() != nil {
+		return 0, ERROR_NOT_SUPPORTED
+	}
 	r0, _, e1 := syscall.SyscallN(procGetTempPath2W.Addr(), uintptr(buflen), uintptr(unsafe.Pointer(buf)))
 	n = uint32(r0)
 	if n == 0 {
@@ -412,6 +427,11 @@ func GetTempPath2(buflen uint32, buf *uint16) (n uint32, err error) {
 }
 
 func GetVolumeInformationByHandle(file syscall.Handle, volumeNameBuffer *uint16, volumeNameSize uint32, volumeNameSerialNumber *uint32, maximumComponentLength *uint32, fileSystemFlags *uint32, fileSystemNameBuffer *uint16, fileSystemNameSize uint32) (err error) {
+	// Not present before Windows Vista. LazyProc.Addr panics on a missing
+	// entry point, so report it as an unsupported operation instead.
+	if procGetVolumeInformationByHandleW.Find() != nil {
+		return ERROR_NOT_SUPPORTED
+	}
 	r1, _, e1 := syscall.SyscallN(procGetVolumeInformationByHandleW.Addr(), uintptr(file), uintptr(unsafe.Pointer(volumeNameBuffer)), uintptr(volumeNameSize), uintptr(unsafe.Pointer(volumeNameSerialNumber)), uintptr(unsafe.Pointer(maximumComponentLength)), uintptr(unsafe.Pointer(fileSystemFlags)), uintptr(unsafe.Pointer(fileSystemNameBuffer)), uintptr(fileSystemNameSize))
 	if r1 == 0 {
 		err = errnoErr(e1)
@@ -496,6 +516,11 @@ func RtlVirtualUnwind(handlerType uint32, baseAddress uintptr, pc uintptr, entry
 }
 
 func SetFileInformationByHandle(handle syscall.Handle, fileInformationClass uint32, buf unsafe.Pointer, bufsize uint32) (err error) {
+	// Not present before Windows Vista. LazyProc.Addr panics on a missing
+	// entry point, so report it as an unsupported operation instead.
+	if procSetFileInformationByHandle.Find() != nil {
+		return ERROR_NOT_SUPPORTED
+	}
 	r1, _, e1 := syscall.SyscallN(procSetFileInformationByHandle.Addr(), uintptr(handle), uintptr(fileInformationClass), uintptr(buf), uintptr(bufsize))
 	if r1 == 0 {
 		err = errnoErr(e1)

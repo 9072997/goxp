@@ -409,19 +409,35 @@ func StartProcess(argv0 string, argv []string, attr *ProcAttr) (pid int, handle 
 			defer DuplicateHandle(parentProcess, fd[i], 0, nil, 0, false, DUPLICATE_CLOSE_SOURCE)
 		}
 	}
-	procAttrList, err := newProcThreadAttributeList(2)
-	if err != nil {
-		return 0, 0, err
+	// Windows XP / Server 2003 have no InitializeProcThreadAttributeList; it
+	// arrived in Vista. Without it there is no PROC_THREAD_ATTRIBUTE_LIST and
+	// no EXTENDED_STARTUPINFO, so fall back to a plain STARTUPINFO and the
+	// older bInheritHandles mechanism, which is what Go used before 1.17.
+	useAttrList := procInitializeProcThreadAttributeList.Find() == nil
+	var procAttrList *procThreadAttributeListContainer
+	if useAttrList {
+		procAttrList, err = newProcThreadAttributeList(2)
+		if err != nil {
+			return 0, 0, err
+		}
+		defer procAttrList.delete()
 	}
-	defer procAttrList.delete()
 	si := new(_STARTUPINFOEXW)
-	si.Cb = uint32(unsafe.Sizeof(*si))
+	if useAttrList {
+		si.Cb = uint32(unsafe.Sizeof(*si))
+	} else {
+		si.Cb = uint32(unsafe.Sizeof(si.StartupInfo))
+	}
 	si.Flags = STARTF_USESTDHANDLES
 	if sys.HideWindow {
 		si.Flags |= STARTF_USESHOWWINDOW
 		si.ShowWindow = SW_HIDE
 	}
 	if sys.ParentProcess != 0 {
+		if !useAttrList {
+			// Reparenting requires PROC_THREAD_ATTRIBUTE_PARENT_PROCESS.
+			return 0, 0, _ERROR_NOT_SUPPORTED
+		}
 		err = procAttrList.update(_PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, unsafe.Pointer(&sys.ParentProcess), unsafe.Sizeof(sys.ParentProcess))
 		if err != nil {
 			return 0, 0, err
@@ -455,7 +471,10 @@ func StartProcess(argv0 string, argv []string, attr *ProcAttr) (pid int, handle 
 	willInheritHandles := len(fd) > 0 && !sys.NoInheritHandles
 
 	// Do not accidentally inherit more than these handles.
-	if willInheritHandles {
+	// Without PROC_THREAD_ATTRIBUTE_HANDLE_LIST (Windows XP) the child
+	// inherits every inheritable handle in this process, as it did before
+	// Go 1.17.
+	if willInheritHandles && useAttrList {
 		err = procAttrList.update(_PROC_THREAD_ATTRIBUTE_HANDLE_LIST, unsafe.Pointer(&fd[0]), uintptr(len(fd))*unsafe.Sizeof(fd[0]))
 		if err != nil {
 			return 0, 0, err
@@ -467,9 +486,12 @@ func StartProcess(argv0 string, argv []string, attr *ProcAttr) (pid int, handle 
 		return 0, 0, err
 	}
 
-	si.ProcThreadAttributeList = procAttrList.list()
 	pi := new(ProcessInformation)
-	flags := sys.CreationFlags | CREATE_UNICODE_ENVIRONMENT | _EXTENDED_STARTUPINFO_PRESENT
+	flags := sys.CreationFlags | CREATE_UNICODE_ENVIRONMENT
+	if useAttrList {
+		si.ProcThreadAttributeList = procAttrList.list()
+		flags |= _EXTENDED_STARTUPINFO_PRESENT
+	}
 	if sys.Token != 0 {
 		err = CreateProcessAsUser(sys.Token, argv0p, argvp, sys.ProcessAttributes, sys.ThreadAttributes, willInheritHandles, flags, &envBlock[0], dirp, &si.StartupInfo, pi)
 	} else {
