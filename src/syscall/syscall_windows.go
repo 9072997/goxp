@@ -667,6 +667,34 @@ func ComputerName() (name string, err error) {
 }
 
 func Ftruncate(fd Handle, length int64) (err error) {
+	// SetFileInformationByHandle is not present before Windows Vista; the
+	// generated wrapper reports ERROR_NOT_SUPPORTED there rather than panicking
+	// on the missing entry point. On Windows XP, seek to the wanted length and
+	// call SetEndOfFile, which is XP-era and sets the end of the file to the
+	// current file pointer. Without this, os.WriteFile fails on XP whenever the
+	// file already exists, because Open applies O_TRUNC by calling Ftruncate.
+	//
+	// The fallback belongs here and not in setFileInformationByHandle: it only
+	// stands in for FileEndOfFileInfo, and the other information classes have no
+	// XP equivalent. Only a missing entry point takes this path, so a genuine
+	// SetFileInformationByHandle failure is still reported to the caller.
+	if procSetFileInformationByHandle.Find() != nil {
+		// (*os.File).Truncate does not change the I/O offset, so save the file
+		// pointer and put it back. Restore it even when SetEndOfFile fails, but
+		// never let the restore hide that failure.
+		var cur, pos int64
+		if err := setFilePointerEx(fd, 0, &cur, FILE_CURRENT); err != nil {
+			return err
+		}
+		if err := setFilePointerEx(fd, length, &pos, FILE_BEGIN); err != nil {
+			return err
+		}
+		err := SetEndOfFile(fd)
+		if err1 := setFilePointerEx(fd, cur, &pos, FILE_BEGIN); err == nil {
+			err = err1
+		}
+		return err
+	}
 	type _FILE_END_OF_FILE_INFO struct {
 		EndOfFile int64
 	}
