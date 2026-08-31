@@ -268,26 +268,29 @@ func (c *Certificate) systemVerify(opts *VerifyOptions) (chains [][]*Certificate
 	}
 
 	if len(chains) == 0 {
-		// Windows XP's root store stopped being updated in 2015 and holds no
-		// anchor for anything issued since. If that - and strictly only that -
-		// is what the platform verifier objected to, verify once more against
-		// the roots compiled into this binary. See xproots_windows.go for why
-		// this exists, and for the test that decides "only that".
+		// Windows XP's root store holds no anchor for anything issued in the
+		// last decade. If the platform verifier could not reach a root it
+		// trusts, verify once more against the roots compiled into this binary
+		// - a full re-verification by Go's own verifier, not a waiver of this
+		// one. See xproots_windows.go for exactly when that is allowed, and for
+		// the argument that it is safe.
 		//
 		// The trust status is read off the chain context rather than inferred
 		// from topErr because CryptoAPI distinguishes an untrusted root from a
-		// revoked certificate, a bad signature or an explicit distrust, and
+		// revoked certificate, a bad signature and an explicit distrust, and
 		// Go's error type does not: checkChainTrustStatus funnels all of them
-		// into the same UnknownAuthorityError.
+		// into the same UnknownAuthorityError. Those distinctions are the whole
+		// basis of the decision, so they have to be read here, before they are
+		// thrown away.
 		//
 		// When the second attempt runs, its answer is the one reported, pass or
-		// fail. Nothing is lost by that: the platform verifier's only complaint
-		// was that it had no anchor, so its error says nothing the Go verifier's
-		// does not, and on XP - where this is the ordinary path, not the rare
-		// one - a hostname or validity failure would otherwise be reported as
-		// "unknown authority" and be undiagnosable. If there is no fallback pool
-		// to try, topErr stands unchanged.
-		if xpNoTrustAnchor(topCtx.TrustStatus.ErrorStatus) {
+		// fail. Nothing is lost by that: the platform verifier could not reach a
+		// trust anchor, so nothing it concluded about the chain was authoritative
+		// anyway, and on XP - where this is the ordinary path, not the rare one -
+		// a hostname or validity failure would otherwise be reported as "unknown
+		// authority" and be undiagnosable. If there is no fallback pool to try,
+		// topErr stands unchanged.
+		if xpFallbackApplies(topCtx.TrustStatus.ErrorStatus) {
 			if chains, err := c.xpVerifyWithFallbackRoots(opts); err != errXPNoFallbackRoots {
 				return chains, err
 			}

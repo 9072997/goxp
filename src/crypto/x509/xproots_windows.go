@@ -7,11 +7,12 @@
 //
 // On Windows, Go does not load a root pool at all: Verify hands the chain to
 // CertGetCertificateChain and trusts whatever the machine store says. XP's
-// store holds five certificates and its auto-root-update service has been dead
-// since 2015, so nothing issued in the last decade has an anchor there -
-// github.com chains to USERTrust ECC Certification Authority, which XP has
-// never heard of. Go's own TLS handshake succeeds, because Go speaks TLS 1.2
-// and 1.3 itself and never touches schannel; it is only the trust decision
+// store is not empty - SP3 has 107 roots, most of them inside crypt32.dll
+// rather than the registry - but they are the 2001 set, and auto-root-update
+// has been dead for years, so nothing issued in the last decade has an anchor
+// there. github.com chains to USERTrust ECC Certification Authority, which XP
+// has never heard of. Go's own TLS handshake succeeds, because Go speaks TLS
+// 1.2 and 1.3 itself and never touches schannel; it is only the trust decision
 // that fails, with "x509: certificate signed by unknown authority".
 //
 // Every program that wanted to work on XP has so far carried its own copy of
@@ -59,31 +60,67 @@ const (
 // package syscall's list of CERT_TRUST_ constants stops before it.
 const certTrustIsPartialChain = 0x00010000
 
-// xpNoTrustAnchor reports whether a CertGetCertificateChain trust status means
-// "could not get to a root I trust", and means nothing else besides.
+// xpFallbackApplies reports whether a CertGetCertificateChain trust status is
+// one the compiled-in roots may be tried against.
 //
-// Two bits carry that meaning. CERT_TRUST_IS_UNTRUSTED_ROOT is set when the
-// chain ends in a self-signed certificate that is not in the store;
-// CERT_TRUST_IS_PARTIAL_CHAIN is set when it ends somewhere else because the
-// issuer could not be found at all. A current chain presented to an XP box
-// produces one or both, depending on whether the server sent its root.
+// Two bits mean "could not get to a root I trust". CERT_TRUST_IS_UNTRUSTED_ROOT
+// is set when the chain ends in a self-signed certificate that is not in the
+// store; CERT_TRUST_IS_PARTIAL_CHAIN is set when it ends somewhere else because
+// the issuer could not be found at all. A current chain presented to an XP box
+// produces one or both, depending on whether the server sent its root. Without
+// one of them there is nothing here to fix, and the platform verifier's answer
+// stands whatever it says.
 //
-// Every other bit is a genuine failure and has to stay one: expiry, revocation,
-// explicit distrust, a bad signature, a broken name or basic constraint, an
-// unsupported critical extension. If any of those is set the answer is no -
-// even when a trust-anchor bit is set alongside it - because re-running such a
-// chain against a different root store could only turn a correct rejection into
-// an acceptance. Keeping the test conjunctive is the entire safety argument for
-// this file; a bare "did it fail for any reason" retry would be a security
-// regression dressed up as a compatibility fix.
+// The question is what to do about the other bits that arrive alongside. The
+// answer is that they are findings about a chain the platform verifier does not
+// trust, and they carry no authority, because the retry is not a rubber stamp -
+// it is a *complete* re-verification by Go's own verifier, which independently
+// rechecks every signature, expiry, host name, extended key usage, and every
+// name, policy and basic constraint, and is stricter than CryptoAPI in places
+// (it will not build a chain through a SHA-1 signature at all). Anything
+// CryptoAPI objected to that is genuinely wrong with the certificate, Go
+// re-derives for itself and rejects on its own authority.
 //
-// Note that Go asks for no revocation checking (systemVerify passes none of the
-// CERT_CHAIN_REVOCATION_CHECK_ flags), so the revocation bits should not appear
-// here. If they ever do, the strict test refuses the fallback, which is the
-// direction to fail in.
-func xpNoTrustAnchor(status uint32) bool {
+// Except for four bits, which Go cannot re-derive and which therefore stay
+// fatal no matter what else is set:
+//
+//   - CERT_TRUST_IS_REVOKED, CERT_TRUST_IS_OFFLINE_REVOCATION and
+//     CERT_TRUST_REVOCATION_STATUS_UNKNOWN. Go does no revocation checking at
+//     all, so it has nothing to say about revocation and cannot reproduce the
+//     finding. (systemVerify passes none of the CERT_CHAIN_REVOCATION_CHECK_
+//     flags, so these should not appear; if they ever do, they are the one
+//     thing here worth more than Go's opinion.)
+//   - CERT_TRUST_IS_EXPLICIT_DISTRUST. Somebody put that certificate in the
+//     disallowed store deliberately. That is an administrator's decision about
+//     this machine, invisible to Go, and overriding it from a bundle compiled
+//     into a binary would be exactly the wrong way round.
+//
+// This started out stricter - any bit besides the two anchor bits refused - and
+// that was wrong, measured on Windows XP SP3 against github.com on 2026-08-31:
+//
+//	ErrorStatus = 0x00000028   IS_NOT_SIGNATURE_VALID | IS_UNTRUSTED_ROOT
+//	  [0] 0x00000008  github.com
+//	  [1] 0x00000008  Sectigo Public Server Authentication CA DV E36
+//	  [2] 0x00000028  Sectigo Public Server Authentication Root E46
+//
+// github.com's chain is ECDSA end to end, and XP's CryptoAPI predates CNG and
+// has no elliptic curve support whatsoever - so it cannot check any of those
+// three signatures and marks all three invalid. Under the strict rule the
+// fallback refused and XP stayed broken, which is precisely the case this file
+// exists for. Go verifies ECDSA perfectly well; XP's inability to is a fact
+// about XP's crypto library, not about the certificate.
+//
+// So: an anchor bit set, and none of the four. It is still not a blanket retry.
+// A status with no anchor bit never falls back however harmless it looks, and a
+// revoked or explicitly distrusted certificate never falls back however much it
+// also looks like a missing root.
+func xpFallbackApplies(status uint32) bool {
 	const anchorBits = syscall.CERT_TRUST_IS_UNTRUSTED_ROOT | certTrustIsPartialChain
-	return status&anchorBits != 0 && status&^anchorBits == 0
+	const opaqueBits = syscall.CERT_TRUST_IS_REVOKED |
+		syscall.CERT_TRUST_REVOCATION_STATUS_UNKNOWN |
+		syscall.CERT_TRUST_IS_OFFLINE_REVOCATION |
+		syscall.CERT_TRUST_IS_EXPLICIT_DISTRUST
+	return status&anchorBits != 0 && status&opaqueBits == 0
 }
 
 var (

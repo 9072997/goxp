@@ -90,11 +90,13 @@ so filling one entry and setting the count to 1 is enough.
 
 On Windows, Go does not load a root pool at all: `crypto/x509` hands the chain
 to `CertGetCertificateChain` and trusts whatever the machine store says. XP's
-store holds **five** certificates and its auto-root-update service has been dead
-since 2015, so nothing issued in the last decade has an anchor there —
-github.com chains to `USERTrust ECC Certification Authority`, which XP has never
-heard of. The TLS handshake itself is fine; Go speaks TLS 1.2 and 1.3 and never
-touches schannel. It is only the trust decision that fails, with
+store holds 107 certificates — measured on SP3, most of them inside
+`crypt32.dll` rather than the registry — but they are the 2001 set, GTE
+CyberTrust and Valicert and Baltimore, and auto-root-update has been dead for
+years. Nothing issued in the last decade has an anchor there: github.com chains
+to `USERTrust ECC Certification Authority`, which XP has never heard of. The TLS
+handshake itself is fine; Go speaks TLS 1.2 and 1.3 and never touches schannel.
+It is only the trust decision that fails, with
 
     x509: certificate signed by unknown authority
 
@@ -103,12 +105,32 @@ Windows binary it builds, and uses it as a **fallback**:
 
 1. The platform verifier runs first, exactly as in stock Go. Its answer stands —
    which is what keeps an enterprise CA installed in the Windows store working.
-2. Only if it fails, and its **only** objection was `CERT_TRUST_IS_UNTRUSTED_ROOT`
-   or `CERT_TRUST_IS_PARTIAL_CHAIN`, is the chain verified again against the
-   compiled-in roots.
-3. Expiry, revocation, a bad signature, explicit distrust, a broken name or
-   basic constraint — alone or alongside a missing anchor — never fall back.
-   A blanket retry would turn genuine certificate failures into successes.
+2. Only if it fails with `CERT_TRUST_IS_UNTRUSTED_ROOT` or
+   `CERT_TRUST_IS_PARTIAL_CHAIN` set — it could not reach a root it trusts — is
+   the chain verified again against the compiled-in roots. That retry is a
+   **complete** re-verification by Go's own verifier: every signature, expiry,
+   host name, EKU and constraint checked afresh, and more strictly than
+   CryptoAPI in places.
+3. Without an anchor bit there is no fallback, whatever else is set — the
+   platform verifier did reach a trusted root, so its refusal is authoritative.
+4. With an anchor bit but `IS_REVOKED`, `IS_OFFLINE_REVOCATION`,
+   `REVOCATION_STATUS_UNKNOWN` or `IS_EXPLICIT_DISTRUST` also set, still no
+   fallback. Those four are exactly what Go cannot reproduce: it does no
+   revocation checking at all, and it cannot see that an administrator put a
+   certificate in this machine's disallowed store.
+
+Everything else CryptoAPI said about a chain it could not anchor is re-derived
+by Go on the retry, which is why it is not pre-judged in step 2. That matters in
+practice rather than in theory: XP's CryptoAPI predates CNG and has no
+elliptic-curve support at all, so it marks *every* signature in github.com's
+all-ECDSA chain invalid (measured on hardware: `ErrorStatus = 0x28`,
+`IS_NOT_SIGNATURE_VALID | IS_UNTRUSTED_ROOT`). That is a fact about XP's crypto
+library, not about the certificate, and Go verifies ECDSA perfectly well. An
+earlier, stricter version of this rule refused that status and left XP exactly
+as broken as before.
+
+`scripts/certprobe.go` in the picoclaw tree prints these bits from a live
+connection, which is how the above was established.
 
 Programs no longer need their own copy of the bundle, and none of this changes
 behaviour on any other GOOS: `linux/386` binaries are byte-identical with and
