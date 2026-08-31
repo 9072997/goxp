@@ -182,6 +182,15 @@ to `1`. This opt-out is expected to be kept indefinitely in case goroutine
 labels acquire sensitive information that shouldn't be made available in
 tracebacks.
 
+This fork added an `x509bundledroots` setting, which controls whether
+crypto/x509 on Windows verifies a chain against the CA bundle compiled into the
+toolchain before consulting the platform certificate store. The default value
+`x509bundledroots=1` tries the bundled roots first and falls back to
+`CertGetCertificateChain` only when they cannot anchor the chain, which is what
+lets a binary reach a modern HTTPS endpoint from Windows XP, whose CryptoAPI
+cannot evaluate an ECDSA chain at all. Setting `x509bundledroots=0` restores the
+stock behavior of using the platform verifier alone.
+
 Go 1.27 added a new `x509sslcertoverrideplatform` setting that controls whether
 crypto/x509 will load roots from disk on Windows and Darwin when `SSL_CERT_FILE`
 or `SSL_CERT_DIR` are set. The default value `x509sslcertoverrideplatform=1` will

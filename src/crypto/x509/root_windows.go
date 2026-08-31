@@ -200,6 +200,33 @@ func verifyChain(c *Certificate, chainCtx *syscall.CertChainContext, opts *Verif
 // systemVerify is like Verify, except that it uses CryptoAPI calls
 // to build certificate chains and verify them.
 func (c *Certificate) systemVerify(opts *VerifyOptions) (chains [][]*Certificate, err error) {
+	// The roots compiled into this toolchain are tried first, by Go's own
+	// verifier, on every Windows version. Only if they cannot anchor the chain
+	// does the platform verifier below get to decide - which is what keeps a
+	// privately installed or enterprise CA working, since such a root is in the
+	// machine store and in no public bundle.
+	//
+	// The order is this way round because CertGetCertificateChain's answer
+	// cannot be interpreted. On Windows XP it rejects chains it merely cannot
+	// evaluate - its CryptoAPI has no elliptic curve support at all - and it
+	// reports that with the same bits it would use for a forgery. Trying to
+	// tell the two apart from the CERT_TRUST_* status is guessing at an intent
+	// the API does not express, and it guessed wrong on real chains. See
+	// rootbundle_windows.go, for that argument and for what the ordering costs.
+	//
+	// The bundle attempt's failure is discarded rather than reported: on a
+	// machine with a working store it is expected to fail for anything chaining
+	// to a private root, and its "unknown authority" would be a worse diagnosis
+	// than the platform's.
+	//
+	// GODEBUG=x509bundledroots=0 makes bundledRoots return nil, leaving stock
+	// behaviour: the platform verifier, and nothing else.
+	if roots := bundledRoots(); roots != nil {
+		if chains, err := c.verifyWithBundledRoots(roots, opts); err == nil {
+			return chains, nil
+		}
+	}
+
 	storeCtx, err := createStoreContext(c, opts)
 	if err != nil {
 		return nil, err
@@ -268,34 +295,10 @@ func (c *Certificate) systemVerify(opts *VerifyOptions) (chains [][]*Certificate
 	}
 
 	if len(chains) == 0 {
-		// Windows XP's root store holds no anchor for anything issued in the
-		// last decade. If the platform verifier could not reach a root it
-		// trusts, verify once more against the roots compiled into this binary
-		// - a full re-verification by Go's own verifier, not a waiver of this
-		// one. See xproots_windows.go for exactly when that is allowed, and for
-		// the argument that it is safe.
-		//
-		// The trust status is read off the chain context rather than inferred
-		// from topErr because CryptoAPI distinguishes an untrusted root from a
-		// revoked certificate, a bad signature and an explicit distrust, and
-		// Go's error type does not: checkChainTrustStatus funnels all of them
-		// into the same UnknownAuthorityError. Those distinctions are the whole
-		// basis of the decision, so they have to be read here, before they are
-		// thrown away.
-		//
-		// When the second attempt runs, its answer is the one reported, pass or
-		// fail. Nothing is lost by that: the platform verifier could not reach a
-		// trust anchor, so nothing it concluded about the chain was authoritative
-		// anyway, and on XP - where this is the ordinary path, not the rare one -
-		// a hostname or validity failure would otherwise be reported as "unknown
-		// authority" and be undiagnosable. If there is no fallback pool to try,
-		// topErr stands unchanged.
-		if xpFallbackApplies(topCtx.TrustStatus.ErrorStatus) {
-			if chains, err := c.xpVerifyWithFallbackRoots(opts); err != errXPNoFallbackRoots {
-				return chains, err
-			}
-		}
-		// Return the error from the highest quality context.
+		// Both verifiers have refused: the bundled roots above could not anchor
+		// the chain, and neither could the machine store. Report the platform's
+		// error, from the highest quality context - the bundle attempt had
+		// nothing to add beyond "unknown authority".
 		return nil, topErr
 	}
 

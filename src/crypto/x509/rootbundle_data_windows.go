@@ -4,12 +4,13 @@
 
 package x509
 
-// xpFallbackRootsPEM is curl's distribution of the Mozilla CA set, compiled
-// into every Windows binary this toolchain produces so that a machine whose
-// own root store is too old to anchor a modern chain - Windows XP, whose store
-// holds five certificates and whose auto-root-update died in 2015 - still has
-// something to verify against. See xproots_windows.go for when it is consulted;
-// it is a fallback, never a replacement for the platform store.
+// bundledRootsPEM is curl's distribution of the Mozilla CA set, compiled into
+// every Windows binary this toolchain produces so that a machine whose own root
+// store is too old to anchor a modern chain - Windows XP, whose store is the
+// 2001 set and whose auto-root-update died years ago - still has something to
+// verify against. See rootbundle_windows.go for how it is consulted: it is
+// tried before the platform store, on every Windows version, and that file
+// records what the ordering costs.
 //
 // Refresh it by regenerating this file from <https://curl.se/ca/cacert.pem>:
 // the body below is the file verbatim, in a raw string literal, so an update is
@@ -18,7 +19,7 @@ package x509
 // go/build/deps_test.go and one more thing for the next rebase to fight over.
 //
 // Any refresh must keep it backtick-free, which a PEM file is.
-const xpFallbackRootsPEM = `##
+const bundledRootsPEM = `##
 ## Bundle of CA Root Certificates
 ##
 ## Certificate data from Mozilla as of: Thu Aug 13 03:12:01 2026 GMT

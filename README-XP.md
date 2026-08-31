@@ -101,52 +101,86 @@ It is only the trust decision that fails, with
     x509: certificate signed by unknown authority
 
 So this toolchain compiles curl's distribution of the Mozilla CA set into every
-Windows binary it builds, and uses it as a **fallback**:
+Windows binary it builds, and verifies against it **before** the machine's own
+store:
 
-1. The platform verifier runs first, exactly as in stock Go. Its answer stands —
-   which is what keeps an enterprise CA installed in the Windows store working.
-2. Only if it fails with `CERT_TRUST_IS_UNTRUSTED_ROOT` or
-   `CERT_TRUST_IS_PARTIAL_CHAIN` set — it could not reach a root it trusts — is
-   the chain verified again against the compiled-in roots. That retry is a
-   **complete** re-verification by Go's own verifier: every signature, expiry,
-   host name, EKU and constraint checked afresh, and more strictly than
-   CryptoAPI in places.
-3. Without an anchor bit there is no fallback, whatever else is set — the
-   platform verifier did reach a trusted root, so its refusal is authoritative.
-4. With an anchor bit but `IS_REVOKED`, `IS_OFFLINE_REVOCATION`,
-   `REVOCATION_STATUS_UNKNOWN` or `IS_EXPLICIT_DISTRUST` also set, still no
-   fallback. Those four are exactly what Go cannot reproduce: it does no
-   revocation checking at all, and it cannot see that an administrator put a
-   certificate in this machine's disallowed store.
+1. Go's own verifier runs first, against the compiled-in roots. If it builds a
+   chain, that is the answer, and `CertGetCertificateChain` is never called.
+   This is a complete verification — every signature, expiry, host name, EKU and
+   constraint — by an implementation that supports the algorithms in use, and it
+   is stricter than CryptoAPI in places (it will not build a chain through a
+   SHA-1 signature at all).
+2. Only if that fails does the platform verifier run, exactly as in stock Go,
+   and its answer — pass or fail — is the one reported. That is what keeps a
+   privately installed or enterprise CA working: such a root is in the machine
+   store and in no public bundle, so step 1 fails and step 2 succeeds.
 
-Everything else CryptoAPI said about a chain it could not anchor is re-derived
-by Go on the retry, which is why it is not pre-judged in step 2. That matters in
-practice rather than in theory: XP's CryptoAPI predates CNG and has no
-elliptic-curve support at all, so it marks *every* signature in github.com's
-all-ECDSA chain invalid (measured on hardware: `ErrorStatus = 0x28`,
-`IS_NOT_SIGNATURE_VALID | IS_UNTRUSTED_ROOT`). That is a fact about XP's crypto
-library, not about the certificate, and Go verifies ECDSA perfectly well. An
-earlier, stricter version of this rule refused that status and left XP exactly
-as broken as before.
+The order used to be the other way round, with the bundle consulted only when
+the `CERT_TRUST_*` status looked like a missing anchor. That could not be made
+to work, and the reason is worth keeping. CryptoAPI has no way to report "I
+cannot evaluate this algorithm": XP predates CNG and has no elliptic-curve
+support at all, so it marks every signature in an ECDSA chain
+`IS_NOT_SIGNATURE_VALID` — the same bit it would set for a forgery. Nor can it
+report "my copy of this root is from 2001": it says `IS_NOT_TIME_VALID`.
+Measured on XP SP3 hardware on 2026-08-31, one minute apart, on two chains that
+are both perfectly good:
 
-`scripts/certprobe.go` in the picoclaw tree prints these bits from a live
-connection, which is how the above was established.
+    github.com:443     0x00000028   IS_NOT_SIGNATURE_VALID | IS_UNTRUSTED_ROOT
+    openrouter.ai:443  0x00000009   IS_NOT_TIME_VALID | IS_NOT_SIGNATURE_VALID
+
+The anchor-bit rule accepted the first and refused the second — leaving
+clawxp's own model provider unreachable from XP — and the difference between
+them is not a security property. It is that Google's chain cross-certifies up to
+a root XP holds a stale copy of, so the walk terminated and no anchor bit was
+set, while Sectigo's does not. Any predicate over those bits is guessing at an
+intent the API does not express. Ordering the verifiers deletes the question.
+
+**What the ordering costs**, on every Windows version, not only XP:
+
+- A chain that verifies against the bundle is accepted without the platform
+  verifier ever running, so Windows' disallowed-certificate store and
+  Microsoft's untrusted CTL are not consulted for it. An explicit distrust —
+  an administrator's or Microsoft's — no longer stops such a chain, and neither
+  does enterprise policy over the machine's root store.
+- The bundle is frozen at link time and cannot learn that a CA was distrusted
+  after the binary was built. `SSL_CERT_FILE` is the way to move it.
+- Revocation is *not* among the costs, though it looks like it should be.
+  CryptoAPI checks CRLs and OCSP only when passed one of the
+  `CERT_CHAIN_REVOCATION_CHECK_` flags, and `systemVerify` passes none of them
+  and never has. Go does no revocation checking either. A revoked certificate
+  was accepted before this change and is accepted after it, by both paths.
+
+`scripts/certprobe.go` in the picoclaw tree prints the platform verifier's bits
+from a live connection, which is how the measurements above were established.
 
 Programs no longer need their own copy of the bundle, and none of this changes
 behaviour on any other GOOS: `linux/386` binaries are byte-identical with and
 without the patch.
 
-Two environment variables, both read once at first use:
+Switching it off, and pointing it elsewhere, both use interfaces Go already has
+rather than any of our own:
 
-| Variable | Effect |
+| Setting | Effect |
 |---|---|
-| `GOXP_CA_BUNDLE` | Path to a PEM to use as the fallback instead of the compiled-in set. For a fresher bundle than the one frozen into the binary, or a private root. An unreadable path disables the fallback rather than silently reverting. |
-| `GOXP_CA_FALLBACK=0` | Disables the fallback entirely — stock Windows behaviour, platform verifier and nothing after it. |
+| `GODEBUG=x509bundledroots=0` | Restores stock Windows behaviour: the platform verifier alone, the compiled-in bundle never consulted. This is the negative control for any claim that the bundle is what made a connection work. |
+| `SSL_CERT_FILE=<path>` | Verify against that PEM and nothing else. Not ours: crypto/x509 has honoured `SSL_CERT_FILE` and `SSL_CERT_DIR` on Windows since Go 1.27, and when either is set `loadSystemRoots` builds an on-disk pool from it, so `Verify` never reaches `systemVerify` or the bundle. Use it for a fresher bundle than the one frozen into the binary, for a private root, or to falsify the wiring by pointing at a PEM that cannot possibly sign the endpoint. **Needs one of the two below to take effect** — measured on XP, an empty `SSL_CERT_FILE` was silently ignored without them and the bundle still verified the chain. |
+| &nbsp;&nbsp;↳ `go 1.27` or later in `go.mod`, or `GODEBUG=x509sslcertoverrideplatform=1` | Upstream registered `x509sslcertoverrideplatform` with `Changed: 27, Old: "0"`, so its default is tied to the consuming module's `go` directive: a module declaring anything older than 1.27 — which every module targeting XP does — gets `=0`, and `SSL_CERT_FILE` is ignored on Windows. This is the exact trap that `x509bundledroots` is registered without `Changed`/`Old` to avoid. |
+| `GODEBUG=x509sslcertoverrideplatform=0` | Upstream's switch for the line above: ignore `SSL_CERT_FILE`/`SSL_CERT_DIR` and use the platform store. |
+
+An earlier version of this patch had two private variables, `GOXP_CA_BUNDLE` and
+`GOXP_CA_FALLBACK`, for the first two rows. Both are gone: the first was a second
+spelling of `SSL_CERT_FILE`, and the second is what GODEBUG exists for.
+
+Note that `x509bundledroots` is registered in `internal/godebugs` with no
+`Changed`/`Old` pair, deliberately. Those fields tie a setting's default to the
+`go` directive in the consuming module's `go.mod`, and every module that targets
+XP declares an older Go than this fork — a version-linked default would switch
+the bundle off in precisely the programs that need it.
 
 The bundle costs about **190 KB** per Windows binary that reaches
 `crypto/x509` (measured: a hello-world doing one HTTPS GET went from 8,678,912
 to 8,872,448 bytes on `windows/386`, +2.2%). Refresh it by regenerating
-`src/crypto/x509/xproots_bundle_windows.go` from <https://curl.se/ca/cacert.pem>.
+`src/crypto/x509/rootbundle_data_windows.go` from <https://curl.se/ca/cacert.pem>.
 
 ## Known unfixed
 
@@ -168,7 +202,8 @@ Windows XP 5.1.2600 x86, 2026-08-28. An agent binary built with this toolchain
 holds a full conversation over TLS, reads directories, and spawns child
 processes.
 
-The root-certificate fallback above is **not** among that — it was added later
-and has only been exercised on Windows 11, where the fallback path is reached by
-pointing `GOXP_CA_BUNDLE` at a locally generated CA. On XP it is the path every
-HTTPS connection takes, so it needs running there before it is believed.
+The bundled-roots path above was added later and has since been exercised on
+that hardware too: both `github.com:443` and `openrouter.ai:443` verify from XP,
+both fail with `GODEBUG=x509bundledroots=0`, and a clawxp agent turn completes
+over TLS. On XP this is the path every HTTPS connection takes, so it is measured
+there rather than believed.
