@@ -4,6 +4,7 @@ Go 1.27.0 that produces binaries Windows XP (NT 5.1) will load and run.
 
     Base:   thongtech/go-legacy-win7 @ 1b73f848   (Go 1.27.0, targets Win7 / PE 6.1)
     Delta:  8 files, +247 / -73                   (takes it back to XP / PE 5.1)
+            + a root-certificate fallback         (see "HTTPS on XP" below)
 
 Upstream Go dropped Windows XP after 1.10. `go-legacy-win7` restores Windows 7;
 this restores XP on top of it, which is a further set of problems because Go has
@@ -85,6 +86,46 @@ plain `STARTUPINFO` with handle inheritance — what Go did before 1.17.
 loop is written against `overlappedEntry` and does not care how many arrived,
 so filling one entry and setting the count to 1 is enough.
 
+## HTTPS on XP
+
+On Windows, Go does not load a root pool at all: `crypto/x509` hands the chain
+to `CertGetCertificateChain` and trusts whatever the machine store says. XP's
+store holds **five** certificates and its auto-root-update service has been dead
+since 2015, so nothing issued in the last decade has an anchor there —
+github.com chains to `USERTrust ECC Certification Authority`, which XP has never
+heard of. The TLS handshake itself is fine; Go speaks TLS 1.2 and 1.3 and never
+touches schannel. It is only the trust decision that fails, with
+
+    x509: certificate signed by unknown authority
+
+So this toolchain compiles curl's distribution of the Mozilla CA set into every
+Windows binary it builds, and uses it as a **fallback**:
+
+1. The platform verifier runs first, exactly as in stock Go. Its answer stands —
+   which is what keeps an enterprise CA installed in the Windows store working.
+2. Only if it fails, and its **only** objection was `CERT_TRUST_IS_UNTRUSTED_ROOT`
+   or `CERT_TRUST_IS_PARTIAL_CHAIN`, is the chain verified again against the
+   compiled-in roots.
+3. Expiry, revocation, a bad signature, explicit distrust, a broken name or
+   basic constraint — alone or alongside a missing anchor — never fall back.
+   A blanket retry would turn genuine certificate failures into successes.
+
+Programs no longer need their own copy of the bundle, and none of this changes
+behaviour on any other GOOS: `linux/386` binaries are byte-identical with and
+without the patch.
+
+Two environment variables, both read once at first use:
+
+| Variable | Effect |
+|---|---|
+| `GOXP_CA_BUNDLE` | Path to a PEM to use as the fallback instead of the compiled-in set. For a fresher bundle than the one frozen into the binary, or a private root. An unreadable path disables the fallback rather than silently reverting. |
+| `GOXP_CA_FALLBACK=0` | Disables the fallback entirely — stock Windows behaviour, platform verifier and nothing after it. |
+
+The bundle costs about **190 KB** per Windows binary that reaches
+`crypto/x509` (measured: a hello-world doing one HTTPS GET went from 8,678,912
+to 8,872,448 bytes on `windows/386`, +2.2%). Refresh it by regenerating
+`src/crypto/x509/xproots_bundle_windows.go` from <https://curl.se/ca/cacert.pem>.
+
 ## Known unfixed
 
 - `CancelIoEx` has no XP equivalent. The fallback is `CancelIo`, which only
@@ -104,3 +145,8 @@ resolution, or I/O deadlines can still find these holes.
 Windows XP 5.1.2600 x86, 2026-08-28. An agent binary built with this toolchain
 holds a full conversation over TLS, reads directories, and spawns child
 processes.
+
+The root-certificate fallback above is **not** among that — it was added later
+and has only been exercised on Windows 11, where the fallback path is reached by
+pointing `GOXP_CA_BUNDLE` at a locally generated CA. On XP it is the path every
+HTTPS connection takes, so it needs running there before it is believed.

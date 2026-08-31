@@ -268,6 +268,30 @@ func (c *Certificate) systemVerify(opts *VerifyOptions) (chains [][]*Certificate
 	}
 
 	if len(chains) == 0 {
+		// Windows XP's root store stopped being updated in 2015 and holds no
+		// anchor for anything issued since. If that - and strictly only that -
+		// is what the platform verifier objected to, verify once more against
+		// the roots compiled into this binary. See xproots_windows.go for why
+		// this exists, and for the test that decides "only that".
+		//
+		// The trust status is read off the chain context rather than inferred
+		// from topErr because CryptoAPI distinguishes an untrusted root from a
+		// revoked certificate, a bad signature or an explicit distrust, and
+		// Go's error type does not: checkChainTrustStatus funnels all of them
+		// into the same UnknownAuthorityError.
+		//
+		// When the second attempt runs, its answer is the one reported, pass or
+		// fail. Nothing is lost by that: the platform verifier's only complaint
+		// was that it had no anchor, so its error says nothing the Go verifier's
+		// does not, and on XP - where this is the ordinary path, not the rare
+		// one - a hostname or validity failure would otherwise be reported as
+		// "unknown authority" and be undiagnosable. If there is no fallback pool
+		// to try, topErr stands unchanged.
+		if xpNoTrustAnchor(topCtx.TrustStatus.ErrorStatus) {
+			if chains, err := c.xpVerifyWithFallbackRoots(opts); err != errXPNoFallbackRoots {
+				return chains, err
+			}
+		}
 		// Return the error from the highest quality context.
 		return nil, topErr
 	}
