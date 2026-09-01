@@ -8,9 +8,75 @@ import (
 	"internal/oserror"
 	"runtime"
 	"structs"
+	"sync"
 	"syscall"
 	"unsafe"
 )
+
+// objDontReparseSupported reports whether this kernel's object manager accepts
+// the OBJ_DONT_REPARSE attribute, which is what makes a handle-relative open
+// refuse to traverse a reparse point instead of following it.
+//
+// OBJ_DONT_REPARSE (0x1000) arrived in Windows 10, version 1607. Older kernels
+// define OBJ_VALID_ATTRIBUTES as 0x000007F2 and reject any open whose
+// Attributes carry a bit outside it with STATUS_INVALID_PARAMETER. That
+// rejection happens while the OBJECT_ATTRIBUTES are being captured, before the
+// name is looked at, so it is not confined to opens that would actually meet a
+// link: without this check every single handle-relative open fails, and with it
+// os.Root has no way to say "do not follow".
+//
+// This is measured rather than derived from a version number, so that it is
+// also right on Wine, ReactOS, and anything else that answers to "Windows".
+// Measured on Windows XP SP3 and on Windows 11: XP returns
+// STATUS_INVALID_PARAMETER for the flagged open and STATUS_SUCCESS for the same
+// open without the flag; Windows 11 returns STATUS_SUCCESS for both.
+var objDontReparseSupported = sync.OnceValue(func() bool {
+	// \??\NUL is the null device. It exists on every NT kernel, and opening it
+	// touches no filesystem, so the probe is the same on any machine.
+	probe := func(attributes uint32) error {
+		objAttrs := &OBJECT_ATTRIBUTES{Attributes: attributes}
+		if err := objAttrs.init(syscall.InvalidHandle, `\??\NUL`); err != nil {
+			return err
+		}
+		var h syscall.Handle
+		err := NtCreateFile(
+			&h,
+			SYNCHRONIZE|FILE_READ_ATTRIBUTES,
+			objAttrs,
+			&IO_STATUS_BLOCK{},
+			nil,
+			FILE_ATTRIBUTE_NORMAL,
+			FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+			FILE_OPEN,
+			FILE_SYNCHRONOUS_IO_NONALERT,
+			nil,
+			0,
+		)
+		if err == nil {
+			syscall.CloseHandle(h)
+		}
+		return err
+	}
+	err := probe(OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE)
+	if err == nil {
+		return true
+	}
+	if s, ok := err.(NTStatus); !ok || s != STATUS_INVALID_PARAMETER {
+		// Refused for some reason other than an invalid parameter. Nothing here
+		// implicates the attribute, so keep the stricter path.
+		return true
+	}
+	// The open was refused as invalid. Blame the attribute only if the
+	// otherwise identical open without it is refused differently; if both fail
+	// the same way the probe itself is at fault, and again we keep the stricter
+	// path. Every ambiguous answer resolves towards "supported".
+	if err := probe(OBJ_CASE_INSENSITIVE); err != nil {
+		if s, ok := err.(NTStatus); ok && s == STATUS_INVALID_PARAMETER {
+			return true
+		}
+	}
+	return false
+})
 
 // Openat flags supported by syscall.Open.
 const (
@@ -105,9 +171,31 @@ func Openat(dirfd syscall.Handle, name string, flag uint64, perm uint32) (_ sysc
 	// Allow File.Stat.
 	access |= STANDARD_RIGHTS_READ | FILE_READ_ATTRIBUTES | FILE_READ_EA
 
+	// checkReparse is set when the refusal to follow a link has to be enforced
+	// after the open rather than by the object manager during it. See
+	// objDontReparseSupported.
+	checkReparse := false
+
 	objAttrs := &OBJECT_ATTRIBUTES{}
 	if flag&O_NOFOLLOW_ANY != 0 {
-		objAttrs.Attributes |= OBJ_DONT_REPARSE
+		if objDontReparseSupported() {
+			objAttrs.Attributes |= OBJ_DONT_REPARSE
+		} else {
+			// Ask for the reparse point itself instead of asking the kernel not
+			// to traverse it, then refuse the handle if that is what we got.
+			// FILE_OPEN_REPARSE_POINT is NT 4-era and is honoured on XP; it
+			// applies to the last component of the name, and every name reaching
+			// Openat from os.Root is a single component resolved against dirfd.
+			//
+			// The check is on a handle we already hold, so nothing can be
+			// swapped underneath it between the test and the use.
+			options |= FILE_OPEN_REPARSE_POINT
+			// A caller that asked for O_FILE_FLAG_OPEN_REPARSE_POINT (Lstat,
+			// Readlink) wants the link itself and must not be refused. That is
+			// also what happens where OBJ_DONT_REPARSE is supported: the two
+			// flags together open the reparse point rather than failing.
+			checkReparse = fileFlags&O_FILE_FLAG_OPEN_REPARSE_POINT == 0
+		}
 	}
 	if flag&syscall.O_CLOEXEC == 0 {
 		objAttrs.Attributes |= OBJ_INHERIT
@@ -156,6 +244,23 @@ func Openat(dirfd syscall.Handle, name string, flag uint64, perm uint32) (_ sysc
 	)
 	if err != nil {
 		return h, ntCreateFileError(err, flag)
+	}
+
+	if checkReparse {
+		// Before anything else touches the file: O_TRUNC below would otherwise
+		// truncate a link we are about to refuse.
+		var d syscall.ByHandleFileInformation
+		if err := syscall.GetFileInformationByHandle(h, &d); err != nil {
+			syscall.CloseHandle(h)
+			return syscall.InvalidHandle, err
+		}
+		if d.FileAttributes&syscall.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+			syscall.CloseHandle(h)
+			// The same error the object manager reports when OBJ_DONT_REPARSE
+			// stops an open: ntCreateFileError maps
+			// STATUS_REPARSE_POINT_ENCOUNTERED to ELOOP.
+			return syscall.InvalidHandle, syscall.ELOOP
+		}
 	}
 
 	if flag&syscall.O_TRUNC != 0 {
@@ -328,36 +433,115 @@ func deleteatFallback(h syscall.Handle) error {
 	if err := syscall.GetFileInformationByHandle(h, &data); err == nil && data.FileAttributes&syscall.FILE_ATTRIBUTE_READONLY != 0 {
 		// Remove read-only attribute. Reopen the file, as it was previously open without FILE_WRITE_ATTRIBUTES access
 		// in order to maximize compatibility in the happy path.
-		wh, err := ReOpenFile(h,
+		wh, err := reopenFileHandle(h,
 			FILE_WRITE_ATTRIBUTES,
 			FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
 			syscall.FILE_FLAG_OPEN_REPARSE_POINT|syscall.FILE_FLAG_BACKUP_SEMANTICS,
+			FILE_OPEN_REPARSE_POINT|FILE_OPEN_FOR_BACKUP_INTENT,
 		)
 		if err != nil {
 			return err
 		}
-		err = SetFileInformationByHandle(
-			wh,
-			FileBasicInfo,
-			unsafe.Pointer(&FILE_BASIC_INFO{
-				FileAttributes: data.FileAttributes &^ FILE_ATTRIBUTE_READONLY,
-			}),
-			uint32(unsafe.Sizeof(FILE_BASIC_INFO{})),
-		)
+		err = SetFileBasicInfoByHandle(wh, &FILE_BASIC_INFO{
+			FileAttributes: data.FileAttributes &^ FILE_ATTRIBUTE_READONLY,
+		})
 		syscall.CloseHandle(wh)
 		if err != nil {
 			return err
 		}
 	}
 
-	return SetFileInformationByHandle(
-		h,
-		FileDispositionInfo,
-		unsafe.Pointer(&FILE_DISPOSITION_INFO{
-			DeleteFile: 1,
-		}),
-		uint32(unsafe.Sizeof(FILE_DISPOSITION_INFO{})),
+	return setFileDispositionByHandle(h)
+}
+
+// reopenFileHandle opens the file that h already refers to, with a different
+// access mask. win32Flags and ntOptions must describe the same thing in the two
+// vocabularies: FILE_FLAG_* for ReOpenFile, FILE_* create options for
+// NtOpenFile.
+//
+// ReOpenFile is documented as Windows XP and later, but is not in XP SP3's
+// kernel32 — measured, not assumed. The fallback is the native call ReOpenFile
+// is a wrapper for: an open of the empty name relative to h, which is how NT
+// spells "this same file again". It reaches the file by handle, not by name, so
+// nothing can be substituted underneath it.
+func reopenFileHandle(h syscall.Handle, access, share, win32Flags, ntOptions uint32) (syscall.Handle, error) {
+	nh, err := ReOpenFile(h, access, share, win32Flags)
+	if err != ERROR_NOT_SUPPORTED {
+		return nh, err
+	}
+	objAttrs := &OBJECT_ATTRIBUTES{Attributes: OBJ_CASE_INSENSITIVE}
+	if err := objAttrs.init(h, ""); err != nil {
+		return syscall.InvalidHandle, err
+	}
+	err = NtOpenFile(
+		&nh,
+		SYNCHRONIZE|access,
+		objAttrs,
+		&IO_STATUS_BLOCK{},
+		share,
+		FILE_SYNCHRONOUS_IO_NONALERT|ntOptions,
 	)
+	if err != nil {
+		return syscall.InvalidHandle, ntCreateFileError(err, 0)
+	}
+	return nh, nil
+}
+
+// Native information classes for NtSetInformationFile. These are the classes
+// underlying SetFileInformationByHandle's FileBasicInfo and FileDispositionInfo,
+// and NtSetInformationFile has accepted both since NT 3.1, whereas
+// SetFileInformationByHandle itself is Vista and later.
+const (
+	FileBasicInformation       = 4
+	FileDispositionInformation = 13
+)
+
+// SetFileBasicInfoByHandle sets the timestamps and attributes of h.
+// A zero field means "leave this one alone".
+//
+// This is SetFileInformationByHandle(FileBasicInfo) where that exists, and the
+// native call it is a wrapper for where it does not (Windows XP and 2003).
+// FILE_BASIC_INFO and FILE_BASIC_INFORMATION have the same 40-byte layout.
+func SetFileBasicInfoByHandle(h syscall.Handle, fbi *FILE_BASIC_INFO) error {
+	if procSetFileInformationByHandle.Find() == nil {
+		return SetFileInformationByHandle(h, FileBasicInfo, unsafe.Pointer(fbi), uint32(unsafe.Sizeof(*fbi)))
+	}
+	err := NtSetInformationFile(h, &IO_STATUS_BLOCK{}, unsafe.Pointer(fbi), uint32(unsafe.Sizeof(*fbi)), FileBasicInformation)
+	if st, ok := err.(NTStatus); ok {
+		return st.Errno()
+	}
+	return err
+}
+
+// setFileDispositionByHandle marks h for deletion when its last handle closes.
+//
+// As with SetFileBasicInfoByHandle, this is the Win32 call where it exists and
+// the native one it wraps where it does not. Without this, deleting through an
+// open handle — which is the only way os.Root can delete anything, since
+// resolving a name against the filesystem is what Root exists to avoid — has no
+// implementation at all on Windows XP: the FileDispositionInformationEx path in
+// Deleteat returns STATUS_INVALID_INFO_CLASS there, and the fallback it drops
+// to ended at SetFileInformationByHandle.
+func setFileDispositionByHandle(h syscall.Handle) error {
+	if procSetFileInformationByHandle.Find() == nil {
+		return SetFileInformationByHandle(
+			h,
+			FileDispositionInfo,
+			unsafe.Pointer(&FILE_DISPOSITION_INFO{DeleteFile: 1}),
+			uint32(unsafe.Sizeof(FILE_DISPOSITION_INFO{})),
+		)
+	}
+	err := NtSetInformationFile(
+		h,
+		&IO_STATUS_BLOCK{},
+		unsafe.Pointer(&FILE_DISPOSITION_INFORMATION{DeleteFile: 1}),
+		uint32(unsafe.Sizeof(FILE_DISPOSITION_INFORMATION{})),
+		FileDispositionInformation,
+	)
+	if st, ok := err.(NTStatus); ok {
+		return st.Errno()
+	}
+	return err
 }
 
 func Renameat(olddirfd syscall.Handle, oldpath string, newdirfd syscall.Handle, newpath string) error {
@@ -596,7 +780,6 @@ func symlinkat(oldname string, newdirfd syscall.Handle, newname string, flags Sy
 		nil)
 	if err != nil {
 		// Creating the symlink has failed, so try to remove the file.
-		const FileDispositionInformation = 13
 		NtSetInformationFile(
 			h,
 			&IO_STATUS_BLOCK{},

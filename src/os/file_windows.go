@@ -472,6 +472,22 @@ func readReparseLink(path string) (string, error) {
 	return readReparseLinkHandle(h)
 }
 
+// readReparseTagHandle returns the reparse tag of h, which must have been
+// opened with FILE_FLAG_OPEN_REPARSE_POINT.
+//
+// This is what GetFileInformationByHandleEx(FileAttributeTagInfo) reports,
+// obtained the pre-Vista way. FSCTL_GET_REPARSE_POINT is defined with
+// FILE_ANY_ACCESS, so it works on the zero-access handles os.Lstat opens.
+func readReparseTagHandle(h syscall.Handle) (uint32, error) {
+	rdbbuf := make([]byte, syscall.MAXIMUM_REPARSE_DATA_BUFFER_SIZE)
+	var bytesReturned uint32
+	err := syscall.DeviceIoControl(h, syscall.FSCTL_GET_REPARSE_POINT, nil, 0, &rdbbuf[0], uint32(len(rdbbuf)), &bytesReturned, nil)
+	if err != nil {
+		return 0, err
+	}
+	return (*windows.REPARSE_DATA_BUFFER)(unsafe.Pointer(&rdbbuf[0])).ReparseTag, nil
+}
+
 func readReparseLinkHandle(h syscall.Handle) (string, error) {
 	rdbbuf := make([]byte, syscall.MAXIMUM_REPARSE_DATA_BUFFER_SIZE)
 	var bytesReturned uint32

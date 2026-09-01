@@ -334,7 +334,7 @@ func chmodat(parent syscall.Handle, name string, mode FileMode) error {
 
 	var fbi windows.FILE_BASIC_INFO
 	fbi.FileAttributes = attrs
-	return windows.SetFileInformationByHandle(h, windows.FileBasicInfo, unsafe.Pointer(&fbi), uint32(unsafe.Sizeof(fbi)))
+	return windows.SetFileBasicInfoByHandle(h, &fbi)
 }
 
 func chownat(parent syscall.Handle, name string, uid, gid int) error {

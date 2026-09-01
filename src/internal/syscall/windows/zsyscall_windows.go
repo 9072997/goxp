@@ -495,6 +495,12 @@ func MultiByteToWideChar(codePage uint32, dwFlags uint32, str *byte, nstr int32,
 }
 
 func ReOpenFile(filehandle syscall.Handle, desiredAccess uint32, shareMode uint32, flagAndAttributes uint32) (handle syscall.Handle, err error) {
+	// Documented as Windows XP and later, but measured absent from XP SP3's
+	// kernel32: it arrived with Server 2003. LazyProc.Addr panics on a missing
+	// entry point, so report it as an unsupported operation instead.
+	if procReOpenFile.Find() != nil {
+		return syscall.InvalidHandle, ERROR_NOT_SUPPORTED
+	}
 	r0, _, e1 := syscall.SyscallN(procReOpenFile.Addr(), uintptr(filehandle), uintptr(desiredAccess), uintptr(shareMode), uintptr(flagAndAttributes))
 	handle = syscall.Handle(r0)
 	if handle == syscall.InvalidHandle {

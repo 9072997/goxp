@@ -54,10 +54,28 @@ func newFileStatFromGetFileInformationByHandle(path string, h syscall.Handle) (f
 	if d.FileAttributes&syscall.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
 		var ti windows.FILE_ATTRIBUTE_TAG_INFO
 		err = windows.GetFileInformationByHandleEx(h, windows.FileAttributeTagInfo, (*byte)(unsafe.Pointer(&ti)), uint32(unsafe.Sizeof(ti)))
-		if err != nil {
+		switch err {
+		case nil:
+			reparseTag = ti.ReparseTag
+		case windows.ERROR_NOT_SUPPORTED:
+			// GetFileInformationByHandleEx is Vista and later. Read the tag out
+			// of the reparse point itself, which is how this was done before
+			// that call existed and is the only way on Windows XP. Without it,
+			// Lstat of a junction fails, and with it so does every os.Root
+			// operation that has to decide whether a name is a link.
+			//
+			// h must have been opened with FILE_FLAG_OPEN_REPARSE_POINT for the
+			// answer to describe h rather than its target. Every caller that can
+			// reach here with the reparse attribute set has done that: without
+			// that flag the open would have followed the link, and the handle
+			// would not carry the attribute.
+			reparseTag, err = readReparseTagHandle(h)
+			if err != nil {
+				return nil, &PathError{Op: "FSCTL_GET_REPARSE_POINT", Path: path, Err: err}
+			}
+		default:
 			return nil, &PathError{Op: "GetFileInformationByHandleEx", Path: path, Err: err}
 		}
-		reparseTag = ti.ReparseTag
 	}
 
 	return &fileStat{
