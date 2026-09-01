@@ -747,6 +747,61 @@ func TestRootRemoveAll(t *testing.T) {
 	}
 }
 
+// TestRootRemoveAllEscapingLinkInDirectory checks that a link pointing outside
+// the root, met partway through a recursive removal rather than named as its
+// argument, is deleted as a link and not walked through.
+//
+// rootTestCases cover a link named directly as the argument to RemoveAll. A
+// link planted *inside* the directory being removed reaches different code: the
+// recursion, which opens each name it lists against the handle of the directory
+// that contained it. Nothing else in the suite exercises that, and getting it
+// wrong deletes somebody else's files.
+func TestRootRemoveAllEscapingLinkInDirectory(t *testing.T) {
+	testenv.MustHaveSymlink(t)
+
+	tmp := t.TempDir()
+
+	outside := filepath.Join(tmp, "outside")
+	if err := os.Mkdir(outside, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	outsideFile := filepath.Join(outside, "file")
+	if err := os.WriteFile(outsideFile, []byte("do not delete"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	rootDir := filepath.Join(tmp, "ROOT")
+	dir := filepath.Join(rootDir, "dir")
+	if err := os.MkdirAll(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "f"), nil, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(dir, "link")); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := os.OpenRoot(rootDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	if err := r.RemoveAll("dir"); err != nil {
+		t.Fatalf(`root.RemoveAll("dir") = %v, want nil`, err)
+	}
+	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("after RemoveAll, os.Lstat(%q) = %v, want ErrNotExist", dir, err)
+	}
+	if _, err := os.Lstat(outside); err != nil {
+		t.Errorf("RemoveAll deleted a directory outside the root: os.Lstat(%q) = %v, want nil", outside, err)
+	}
+	if _, err := os.Lstat(outsideFile); err != nil {
+		t.Errorf("RemoveAll deleted a file outside the root: os.Lstat(%q) = %v, want nil", outsideFile, err)
+	}
+}
+
 func TestRootOpenFileAsRoot(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "target")

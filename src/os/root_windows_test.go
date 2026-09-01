@@ -12,6 +12,7 @@ import (
 	"internal/strconv"
 	"internal/syscall/windows"
 	"internal/testenv"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -363,4 +364,101 @@ func TestRootOpenFileFlagInvalid(t *testing.T) {
 		t.Fatalf("expected os.ErrInvalid, got %v", err)
 	}
 	f.Close()
+}
+
+// TestRootJunctionContainment plants a directory junction pointing outside the
+// root and checks that a Root neither reads nor deletes through it.
+//
+// A junction is the only escaping link an ordinary user can create on every
+// Windows this toolchain targets. NTFS symbolic links are Vista and later and
+// creating one needs SeCreateSymbolicLinkPrivilege or developer mode;
+// FSCTL_SET_REPARSE_POINT with IO_REPARSE_TAG_MOUNT_POINT needs neither and has
+// worked since Windows 2000, so this test runs everywhere, including on the
+// versions where the object manager rejects OBJ_DONT_REPARSE and containment
+// has to be enforced by inspecting the handle instead.
+func TestRootJunctionContainment(t *testing.T) {
+	tmp := t.TempDir()
+
+	outside := filepath.Join(tmp, "outside")
+	if err := os.Mkdir(outside, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	outsideFile := filepath.Join(outside, "secret")
+	if err := os.WriteFile(outsideFile, []byte("do not delete"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	rootDir := filepath.Join(tmp, "ROOT")
+	dir := filepath.Join(rootDir, "dir")
+	if err := os.MkdirAll(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "f"), nil, 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	var rd reparseData
+	rd.addSubstituteName(`\??\` + outside)
+	rd.addPrintName(outside)
+	if err := createMountPoint(filepath.Join(dir, "j"), &rd); err != nil {
+		t.Skipf("cannot create a junction here: %v", err)
+	}
+
+	// The junction really does lead outside when resolved by name.
+	if _, err := os.Stat(filepath.Join(dir, "j", "secret")); err != nil {
+		t.Fatalf("junction does not resolve, so this test proves nothing: %v", err)
+	}
+
+	r, err := os.OpenRoot(rootDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	if f, err := r.Open(`dir\j\secret`); err == nil {
+		f.Close()
+		t.Errorf(`root.Open("dir\j\secret") succeeded; want an error`)
+	}
+	if _, err := r.Stat(`dir\j\secret`); err == nil {
+		t.Errorf(`root.Stat("dir\j\secret") succeeded; want an error`)
+	}
+	if f, err := r.OpenRoot(`dir\j`); err == nil {
+		f.Close()
+		t.Errorf(`root.OpenRoot("dir\j") succeeded; want an error`)
+	}
+
+	// Stat resolves the link and so must refuse. Lstat sees the link itself,
+	// which is not an escape and must work.
+	if _, err := r.Stat(`dir\j`); err == nil {
+		t.Errorf(`root.Stat("dir\j") succeeded; want an error`)
+	}
+	if fi, err := r.Lstat(`dir\j`); err != nil {
+		t.Errorf(`root.Lstat("dir\j") = %v, want nil`, err)
+	} else {
+		// A junction reports ModeIrregular rather than ModeSymlink: Mode maps
+		// only IO_REPARSE_TAG_SYMLINK to ModeSymlink. The load-bearing
+		// assertion is IsDir, which is false only if the reparse tag was read
+		// and recognised as a name surrogate. A tag of zero — which is what
+		// failing to read the tag looks like — reports the junction as an
+		// ordinary directory.
+		if fi.Mode()&fs.ModeIrregular == 0 {
+			t.Errorf(`root.Lstat("dir\j").Mode() = %v, want ModeIrregular set`, fi.Mode())
+		}
+		if fi.IsDir() {
+			t.Errorf(`root.Lstat("dir\j").IsDir() = true, want false: the reparse tag was not read`)
+		}
+	}
+
+	if err := r.RemoveAll("dir"); err != nil {
+		t.Fatalf(`root.RemoveAll("dir") = %v, want nil`, err)
+	}
+	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("after RemoveAll, os.Lstat(%q) = %v, want ErrNotExist", dir, err)
+	}
+	if _, err := os.Lstat(outside); err != nil {
+		t.Errorf("RemoveAll deleted a directory outside the root: os.Lstat(%q) = %v, want nil", outside, err)
+	}
+	if _, err := os.Lstat(outsideFile); err != nil {
+		t.Errorf("RemoveAll deleted a file outside the root: os.Lstat(%q) = %v, want nil", outsideFile, err)
+	}
 }
