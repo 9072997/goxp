@@ -5,6 +5,7 @@ Go 1.27.0 that produces binaries Windows XP (NT 5.1) will load and run.
     Base:   thongtech/go-legacy-win7 @ 1b73f848   (Go 1.27.0, targets Win7 / PE 6.1)
     Delta:  8 files, +247 / -73                   (takes it back to XP / PE 5.1)
             + a root-certificate fallback         (see "HTTPS on XP" below)
+            + os.Root.RemoveAll restored          (see "os.Root.RemoveAll" below)
 
 Upstream Go dropped Windows XP after 1.10. `go-legacy-win7` restores Windows 7;
 this restores XP on top of it, which is a further set of problems because Go has
@@ -181,6 +182,64 @@ The bundle costs about **190 KB** per Windows binary that reaches
 `crypto/x509` (measured: a hello-world doing one HTTPS GET went from 8,678,912
 to 8,872,448 bytes on `windows/386`, +2.2%). Refresh it by regenerating
 `src/crypto/x509/rootbundle_data_windows.go` from <https://curl.se/ca/cacert.pem>.
+
+## os.Root.RemoveAll
+
+The base fork's commit c0f79a96 "Use removeall_noat variant on Windows" moved
+Windows off `removeall_at.go`, which is right — the `_at` walk wants
+openat/unlinkat-shaped syscalls — but it deleted `Root.RemoveAll` and *both*
+`rootRemoveAll` implementations along with it instead of writing a Windows one.
+The result was a toolchain whose `os.Root` was missing a method upstream Go
+1.25 shipped and `api/go1.25.txt` still lists: user code calling
+`root.RemoveAll` failed to compile, and `go test os` failed to build.
+
+Restored here in four pieces:
+
+| File | Change |
+|---|---|
+| `src/os/root.go` | the `Root.RemoveAll` method, upstream doc comment and all |
+| `src/os/root_removeall_at.go` | `rootRemoveAll` for `unix \|\| wasip1`, upstream's, calling `removeAllFrom` (adapted only to this tree's `doInRoot` signature) |
+| `src/os/root_removeall_windows.go` | a new handle-relative walk for Windows |
+| `src/os/root_noopenat.go` | `rootRemoveAll` for js/wasm and plan9, plus the `syscall` import c0f79a96 dropped while leaving two uses behind |
+
+Windows cannot use either deleted implementation. The `root_openat.go` one
+calls `removeAllFrom`, which lives in the `removeall_at.go` that commit turned
+off for Windows; the `root_noopenat.go` one calls `checkPathEscapesLstat`,
+which only exists on js and plan9. So Windows gets its own, modelled on
+`removeAllFrom` but built from the `*at` primitives `root_windows.go` already
+has: `removefileat`, `removedirat`, `rootOpenDir`.
+
+**Why it cannot walk out of the root.** Every syscall in the walk is issued
+against an open directory handle with a single path component — never a path,
+never `..`. `doInRoot` resolves the caller's path to (parent handle, leaf) and
+rejects anything that escapes; from there the recursion only ever descends
+through handles it opened itself with `O_NOFOLLOW_ANY`, so a reparse point
+cannot be traversed: `rootOpenDir` fails on it rather than following it. A
+symlink met mid-walk is therefore deleted as a link and never followed, whether
+it points inside the root or outside it — the same thing upstream's
+`removeAllFrom` does. Deletion uses `FILE_OPEN_REPARSE_POINT` for the same
+reason. An attacker who swaps a directory for a symlink between two steps
+changes nothing: the next `rootOpenDir` on that handle returns `errSymlink`,
+the walk stops descending, and `removedirat` removes the link itself.
+
+The one thing resolved by *path* rather than by handle is the name given to the
+`*File` wrapping each directory handle, which `File.readdir` needs for its
+`FindFirstFile` fallback — the fallback XP takes, since it has no
+`GetFileInformationByHandleEx`. That path is used only to *list* names. If it
+were ever wrong, the names it produced would still be deleted relative to the
+correct parent handle, so the blast radius is a spurious `ENOTEMPTY`, not a
+deletion outside the root.
+
+**Edge cases**, matching upstream and pinned by the tests already in
+`root_test.go`: trailing separators are stripped, so `RemoveAll("file/")`
+succeeds; `RemoveAll(".")` is `EINVAL`; a missing target is success; an
+intermediate component that is not a directory is success. That last one is
+mapped explicitly on Windows (`ENOTDIR` → `nil`), because here `Root.RemoveAll`
+is the `_at` walk while the package-level `RemoveAll` is the `noat` one, and
+`TestRootConsistencyRemoveAll` compares the two.
+
+`go test os` passes apart from the pre-existing `TestFileReadDir` failure noted
+under "Known unfixed".
 
 ## Known unfixed
 
