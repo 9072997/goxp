@@ -1339,6 +1339,12 @@ func fdpath(fd Handle, buf []uint16) ([]uint16, error) {
 			buf = buf[:n]
 			break
 		}
+		// GetFinalPathNameByHandleW is Vista and later. Where it is missing
+		// the shim reports _ERROR_NOT_SUPPORTED, and NtQueryObject answers
+		// the same question. See fdpathxp_windows.go.
+		if err == _ERROR_NOT_SUPPORTED {
+			return fdpathXP(fd)
+		}
 		if err != _ERROR_NOT_ENOUGH_MEMORY {
 			return nil, err
 		}
