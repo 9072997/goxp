@@ -68,11 +68,18 @@ func (fd *netFD) init() error {
 		}
 		// Disable reporting of NET_UNREACHABLE errors.
 		// See https://go.dev/issue/68614.
+		//
+		// SIO_UDP_NETRESET is Windows 8 and later. Windows XP's Winsock
+		// rejects the control code itself with WSAEINVAL, and because any
+		// error here aborts init(), leaving it fatal makes every UDP socket
+		// on XP fail to open - not merely miss this notification. The
+		// preceding SIO_UDP_CONNRESET dates from Windows 2000 and does
+		// work, so it stays fatal.
 		ret = 0
 		flag = 0
 		size = uint32(unsafe.Sizeof(flag))
 		err = syscall.WSAIoctl(fd.pfd.Sysfd, windows.SIO_UDP_NETRESET, (*byte)(unsafe.Pointer(&flag)), size, nil, 0, &ret, nil, 0)
-		if err != nil {
+		if err != nil && err != windows.WSAEINVAL {
 			return wrapSyscallError("wsaioctl", err)
 		}
 	}
