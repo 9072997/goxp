@@ -741,6 +741,11 @@ func (c *Cmd) Start() error {
 		return err
 	}
 
+	// The parent's ends of any pipes created above must not reach the child.
+	// See dontInheritPipes: on pre-Vista Windows they otherwise would, and a
+	// child reading stdin from a pipe would never see EOF.
+	dontInheritPipes(c.parentIOPipes)
+
 	c.Process, err = os.StartProcess(lp, c.argv(), &os.ProcAttr{
 		Dir:   c.Dir,
 		Files: childFiles,

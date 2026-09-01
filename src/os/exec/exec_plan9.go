@@ -4,7 +4,15 @@
 
 package exec
 
-import "io/fs"
+import (
+	"io"
+	"io/fs"
+)
+
+// dontInheritPipes is a no-op here. Handle inheritance is a Windows concept;
+// on this platform the child's file descriptors are exactly those passed to
+// StartProcess.
+func dontInheritPipes(pipes []io.Closer) {}
 
 // skipStdinCopyError optionally specifies a function which reports
 // whether the provided stdin copy error should be ignored.
