@@ -68,8 +68,22 @@ func (a highPrecisionTime) sub(b highPrecisionTime) time.Duration {
 
 	if queryPerformanceFrequency == 0 {
 		queryPerformanceFrequency = windows.QueryPerformanceFrequency()
+		if queryPerformanceFrequency == 0 {
+			// bits.Div64 panics on a zero divisor. There is nothing to scale
+			// by, so report no elapsed time, as above.
+			return 0
+		}
 	}
 	hi, lo := bits.Mul64(uint64(delta), uint64(time.Second)/uint64(time.Nanosecond))
+	if hi >= uint64(queryPerformanceFrequency) {
+		// The same disagreement between per-core counters as above, in the
+		// other direction: a goroutine can also migrate onto a core whose TSC
+		// is far ahead, making delta enormous rather than negative. bits.Div64
+		// panics when y <= hi, and a quotient that large means more than 2^64
+		// nanoseconds - about 584 years - so this is a bad reading and not a
+		// long interval.
+		return 0
+	}
 	quo, _ := bits.Div64(hi, lo, uint64(queryPerformanceFrequency))
 	return time.Duration(quo)
 }
