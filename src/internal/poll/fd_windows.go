@@ -277,6 +277,15 @@ func (fd *FD) execIO(
 		// a locked goroutine parks its M with it, and the runtime is slow to
 		// give those threads back. That is the price of a working cancel here;
 		// the alternative is waitIO blocking forever, which is what this fixes.
+		//
+		// Narrowing this to "only when a deadline is armed" is the obvious
+		// optimisation and it is wrong: Close can race a pending operation on
+		// an fd that never had a deadline set, and that path needs the pin
+		// just as much. Making it safe would mean Close forcing completion by
+		// closing the handle, which reopens the handle-reuse hazard the
+		// deferred close exists to prevent. The unconditional lock is the
+		// deliberate choice - the thread cost is accepted in exchange for
+		// code that is simple enough to be obviously correct.
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 	}
