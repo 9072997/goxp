@@ -114,6 +114,27 @@ var SupportTCPInitialRTONoSYNRetransmissions = sync.OnceValue(func() bool {
 	return major >= 10 && build >= 16299
 })
 
+// SupportCancelIoEx reports whether CancelIoEx is available. It arrived with
+// Windows Vista.
+//
+// Where it is missing, syscall.CancelIoEx falls back to CancelIo, which cancels
+// only I/O issued by the *calling thread* and returns success even when it
+// cancelled nothing at all - so a cancel from any other thread silently does
+// nothing and the waiter blocks forever. internal/poll keeps a goroutine on one
+// OS thread for the lifetime of an operation when this reports false, so that
+// the fallback cancels what it was asked to. See execIO.
+//
+// Probed rather than derived from the version number: the question is whether
+// the entry point is there, and asking that directly cannot drift.
+// Declared here rather than in zsyscall_windows.go so that file stays as
+// mksyscall generated it. Nothing calls CancelIoEx through this package;
+// the proc exists only to be probed.
+var procCancelIoEx = modkernel32.NewProc("CancelIoEx")
+
+var SupportCancelIoEx = sync.OnceValue(func() bool {
+	return procCancelIoEx.Find() == nil
+})
+
 // SupportUnixSocket indicates whether the current Windows version supports
 // Unix Domain Sockets.
 // The minimal requirement is Windows 10.0.17063.

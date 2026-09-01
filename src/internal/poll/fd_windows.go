@@ -259,6 +259,27 @@ func (fd *FD) execIO(
 	submit func(o *operation) (uint32, error),
 	pinPtrs ...any,
 ) (int, error) {
+	if !windows.SupportCancelIoEx() {
+		// Without CancelIoEx, waitIO's cancel becomes CancelIo, which cancels
+		// only I/O issued by the calling thread and reports success even when
+		// it cancelled nothing. submit and the cancel already run in the same
+		// goroutine; what breaks them apart is that the goroutine parks in
+		// waitIO and can resume on a different M. Pin it so they stay on one
+		// thread and the cancel reaches the operation it was asked to cancel.
+		//
+		// Before submit, not after: the I/O is attributed to whichever thread
+		// issues it, so locking later pins the wrong one. Locking after submit
+		// and before the park would usually land on the same M, but async
+		// preemption can move the goroutine in that window, and a race that
+		// rare is worse than the cost below.
+		//
+		// The cost is one OS thread per operation that actually blocks, since
+		// a locked goroutine parks its M with it, and the runtime is slow to
+		// give those threads back. That is the price of a working cancel here;
+		// the alternative is waitIO blocking forever, which is what this fixes.
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+	}
 	// Notify runtime netpoll about starting IO.
 	err := fd.pd.prepare(mode, fd.isFile)
 	if err != nil {
