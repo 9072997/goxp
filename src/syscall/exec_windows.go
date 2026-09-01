@@ -474,6 +474,21 @@ func StartProcess(argv0 string, argv []string, attr *ProcAttr) (pid int, handle 
 	// Without PROC_THREAD_ATTRIBUTE_HANDLE_LIST (Windows XP) the child
 	// inherits every inheritable handle in this process, as it did before
 	// Go 1.17.
+	//
+	// That is not merely untidy on XP, it hangs things. syscall.Pipe makes
+	// both ends inheritable, so a child started with a pipe on its stdin also
+	// receives a duplicate of the parent's WRITE end. The child then waits for
+	// an EOF that cannot arrive, because a handle it holds itself keeps the
+	// pipe open. Measured: `gofmt` fed from a bytes.Reader never exits, which
+	// is why internal/platform's TestGenerated burns its whole timeout, and
+	// cmd/addr2line does the same.
+	//
+	// The fix does not belong here - StartProcess cannot enumerate the
+	// handles that must not be inherited. os/exec can: it already tracks them
+	// in Cmd.parentIOPipes, which is exactly the set. Clearing
+	// HANDLE_FLAG_INHERIT on those before starting the child is correct on
+	// every Windows and a no-op on Vista and later, where the attribute list
+	// already excludes them.
 	if willInheritHandles && useAttrList {
 		err = procAttrList.update(_PROC_THREAD_ATTRIBUTE_HANDLE_LIST, unsafe.Pointer(&fd[0]), uintptr(len(fd))*unsafe.Sizeof(fd[0]))
 		if err != nil {

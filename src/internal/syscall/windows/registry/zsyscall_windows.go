@@ -82,6 +82,11 @@ func regEnumValue(key syscall.Handle, index uint32, name *uint16, nameLen *uint3
 }
 
 func regLoadMUIString(key syscall.Handle, name *uint16, buf *uint16, buflen uint32, buflenCopied *uint32, flags uint32, dir *uint16) (regerrno error) {
+	// Not present before Windows Vista. LazyProc.Addr panics on a missing
+	// entry point, so report it as an unsupported operation instead.
+	if procRegLoadMUIStringW.Find() != nil {
+		return syscall.ERROR_PROC_NOT_FOUND
+	}
 	r0, _, _ := syscall.SyscallN(procRegLoadMUIStringW.Addr(), uintptr(key), uintptr(unsafe.Pointer(name)), uintptr(unsafe.Pointer(buf)), uintptr(buflen), uintptr(unsafe.Pointer(buflenCopied)), uintptr(flags), uintptr(unsafe.Pointer(dir)))
 	if r0 != 0 {
 		regerrno = syscall.Errno(r0)
