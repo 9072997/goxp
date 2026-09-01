@@ -214,16 +214,31 @@ func (c *Certificate) systemVerify(opts *VerifyOptions) (chains [][]*Certificate
 	// the API does not express, and it guessed wrong on real chains. See
 	// rootbundle_windows.go, for that argument and for what the ordering costs.
 	//
-	// The bundle attempt's failure is discarded rather than reported: on a
-	// machine with a working store it is expected to fail for anything chaining
-	// to a private root, and its "unknown authority" would be a worse diagnosis
-	// than the platform's.
+	// Only an anchor failure falls through. On a machine with a working store
+	// the bundle is expected to fail for anything chaining to a private root,
+	// and there its "unknown authority" is a worse diagnosis than the
+	// platform's - so that one is discarded and the platform decides.
+	//
+	// Any other failure is kept. verifyWithBundledRoots runs the whole of
+	// Verify, so it can also build a chain and then reject it for a specific
+	// reason: wrong hostname, expired, incompatible key usage. Discarding that
+	// and falling through replaces a precise answer with the platform's
+	// generic UnknownAuthorityError - which on XP is what a root store older
+	// than the certificate says about almost anything. Callers that switch on
+	// the error type, crypto/tls among them, then cannot tell why a connection
+	// was refused, and a hostname mismatch becomes indistinguishable from an
+	// untrusted issuer.
 	//
 	// GODEBUG=x509bundledroots=0 makes bundledRoots return nil, leaving stock
 	// behaviour: the platform verifier, and nothing else.
 	if roots := bundledRoots(); roots != nil {
-		if chains, err := c.verifyWithBundledRoots(roots, opts); err == nil {
+		chains, err := c.verifyWithBundledRoots(roots, opts)
+		if err == nil {
 			return chains, nil
+		}
+		var unknownAuthority UnknownAuthorityError
+		if !errors.As(err, &unknownAuthority) {
+			return nil, err
 		}
 	}
 
