@@ -85,6 +85,7 @@ func rootRemoveAllFrom(parentFd sysfdType, base, path string) error {
 
 	// Remove the directory's entries.
 	var recurseErr error
+Walk:
 	for {
 		const reqSize = 1024
 		var respSize int
@@ -118,7 +119,22 @@ func rootRemoveAllFrom(parentFd sysfdType, base, path string) error {
 			if readErr != nil && readErr != io.EOF {
 				file.Close()
 				if IsNotExist(readErr) {
-					return nil
+					// Upstream's fd-based walk returns success here: if the
+					// descriptor it is reading says the directory is gone, it
+					// is gone. This listing is not fd-based. On the Windows
+					// versions without GetFileInformationByHandleEx,
+					// File.readdir falls back to FindFirstFile, which resolves
+					// the directory by name, and a name that no longer resolves
+					// gives ERROR_PATH_NOT_FOUND — which IsNotExist accepts.
+					// So this error does not establish that the directory is
+					// gone, only that we cannot list it.
+					//
+					// Stop listing and let removedirat below answer the
+					// question: it succeeds if the directory really has gone,
+					// and fails with ENOTEMPTY if it has not. Reporting success
+					// while someone's files are still on disk is worse than
+					// either.
+					break Walk
 				}
 				return &PathError{Op: "readdirnames", Path: base, Err: readErr}
 			}
