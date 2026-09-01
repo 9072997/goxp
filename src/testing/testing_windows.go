@@ -53,6 +53,18 @@ func highPrecisionTimeNow() highPrecisionTime {
 
 func (a highPrecisionTime) sub(b highPrecisionTime) time.Duration {
 	delta := a.now - b.now
+	if delta < 0 {
+		// QueryPerformanceCounter is not guaranteed to agree between processors
+		// on Windows XP, where it is read from each core's TSC. A goroutine
+		// that migrates between cores can therefore see the counter run
+		// backwards. Measured on XP SP3: `go test os` panics partway through,
+		// because a negative delta becomes a near-2^64 unsigned one and
+		// bits.Div64 overflows its quotient.
+		//
+		// Reporting no elapsed time is a better answer than a panic, and on a
+		// machine whose counter really is monotonic this branch never runs.
+		return 0
+	}
 
 	if queryPerformanceFrequency == 0 {
 		queryPerformanceFrequency = windows.QueryPerformanceFrequency()
