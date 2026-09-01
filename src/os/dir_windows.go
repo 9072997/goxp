@@ -87,6 +87,27 @@ func (d *dirInfo) init(h syscall.Handle) {
 	// but the reparse point should still live in the parent volume.
 	var flags uint32
 	err := windows.GetVolumeInformationByHandle(h, nil, 0, &d.vol, nil, &flags, nil, 0)
+	if err == windows.ERROR_NOT_SUPPORTED {
+		// Pre-Vista: GetVolumeInformationByHandleW does not exist here. Both
+		// things it was asked for are still obtainable. The volume serial is in
+		// GetFileInformationByHandle, which is XP-era. The flags only choose
+		// between the file-ID route and the path route below, and the file-ID
+		// route is Vista+ as well, so the path route is the only candidate and
+		// the flags need not be read at all.
+		//
+		// Returning early here instead would leave every entry with a zero
+		// volume and no path, which does not merely disable os.SameFile - it
+		// makes it answer wrongly in both directions, since two entries that
+		// are both zero compare equal and an entry never matches its own Stat.
+		var i syscall.ByHandleFileInformation
+		if err := syscall.GetFileInformationByHandle(h, &i); err != nil {
+			d.vol = 0
+			return
+		}
+		d.vol = i.VolumeSerialNumber
+		d.path, _ = windows.FinalPath(h, windows.FILE_NAME_OPENED)
+		return
+	}
 	if err != nil {
 		d.vol = 0 // Set to zero in case Windows writes garbage to it.
 		// If we can't get the volume information, we can't use os.SameFile,

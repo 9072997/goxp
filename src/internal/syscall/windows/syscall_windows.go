@@ -491,6 +491,11 @@ func FinalPath(h syscall.Handle, flags uint32) (string, error) {
 	buf := make([]uint16, 100)
 	for {
 		n, err := GetFinalPathNameByHandle(h, &buf[0], uint32(len(buf)), flags)
+		if err == ERROR_NOT_SUPPORTED {
+			// Pre-Vista: no GetFinalPathNameByHandleW at all. NtQueryObject
+			// answers the same question. See finalpathxp_windows.go.
+			return finalPathXP(h)
+		}
 		if err != nil {
 			return "", err
 		}
