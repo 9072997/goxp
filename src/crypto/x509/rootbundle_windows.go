@@ -90,15 +90,17 @@ var (
 //
 // The setting is read on every call, not once: a GODEBUG can be changed at run
 // time, and only the parsing of the PEM is worth caching.
-// A current bundle is not a superset of an old platform store, and one test
-// makes that visible. crypto/x509's TestSystemVerify/SHA-384 pins
-// currentTime to May 2019 and expects a chain to "DigiCert Global Root CA",
-// the 2006 root. Mozilla has since removed it - curl's set carries DigiCert's
-// G2, G3, G4, G5 and Assured ID G2/G3 and not that one - so the bundle
-// declines the chain, correctly, and XP's own store cannot help because its
-// roots are older still. The subtest therefore fails here by construction.
-// It is not a defect in this file, and adding a removed root back to make a
-// test green would be the wrong trade.
+// A current bundle is not a superset of an old platform store, and that has
+// consequences beyond XP. Mozilla removes roots; Microsoft's programme keeps
+// some of them longer. So a chain the platform verifier would accept can be
+// declined here, and the right answer is usually still to decline it - the
+// bundle reflects what is trusted now.
+//
+// crypto/x509's own tests found this: TestSystemVerify/SHA-384 was anchored at
+// "DigiCert Global Root CA", the 2006 root, which Mozilla has dropped. It was
+// re-anchored on a chain whose root is still distributed rather than teaching
+// this file to trust a retired one. If that subtest ever fails again, check
+// whether its root has left the bundle before looking for a bug here.
 
 func bundledRoots() *CertPool {
 	if x509bundledroots.Value() == "0" {
