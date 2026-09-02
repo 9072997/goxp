@@ -20,6 +20,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"unsafe"
@@ -165,12 +166,36 @@ func callback(timeFormatString unsafe.Pointer, lparam uintptr) uintptr {
 	return 0 // stop enumeration
 }
 
+// nestedCallMu guards nestedCallFunc, which carries the closure to
+// callbackNoLParam on Windows versions whose enumerator passes no lParam.
+var (
+	nestedCallMu   sync.Mutex
+	nestedCallFunc func()
+)
+
+func callbackNoLParam(timeFormatString unsafe.Pointer) uintptr {
+	nestedCallFunc()
+	return 0 // stop enumeration
+}
+
 // nestedCall calls into Windows, back into Go, and finally to f.
 func nestedCall(t *testing.T, f func()) {
-	c := syscall.NewCallback(callback)
 	d := GetDLL(t, "kernel32.dll")
 	defer d.Release()
 	const LOCALE_NAME_USER_DEFAULT = 0
+	if _, err := d.DLL.FindProc("EnumTimeFormatsEx"); err != nil {
+		// Before Vista. EnumTimeFormatsW enumerates the same way but its
+		// callback receives only the format string, so pass f in a package
+		// variable. The lock is held across the call, not just the store:
+		// the callback runs inside it.
+		nestedCallMu.Lock()
+		defer nestedCallMu.Unlock()
+		nestedCallFunc = f
+		const LOCALE_USER_DEFAULT = 0x400
+		d.Proc("EnumTimeFormatsW").Call(syscall.NewCallback(callbackNoLParam), LOCALE_USER_DEFAULT, 0)
+		return
+	}
+	c := syscall.NewCallback(callback)
 	d.Proc("EnumTimeFormatsEx").Call(c, LOCALE_NAME_USER_DEFAULT, 0, uintptr(*(*unsafe.Pointer)(unsafe.Pointer(&f))))
 }
 
@@ -648,6 +673,17 @@ func TestZeroDivisionException(t *testing.T) {
 }
 
 func TestWERDialogue(t *testing.T) {
+	if os.Getenv("TEST_WER_DIALOGUE") != "1" {
+		// Windows Error Reporting is Vista and later. Without it the child
+		// stops at a modal dialog instead of reporting and exiting, and the
+		// parent waits for a process that will never finish.
+		d := GetDLL(t, "kernel32.dll")
+		_, err := d.DLL.FindProc("WerRegisterFile")
+		d.Release()
+		if err != nil {
+			t.Skip("Windows Error Reporting is not available before Vista; the child would wait at a modal dialog")
+		}
+	}
 	if os.Getenv("TEST_WER_DIALOGUE") == "1" {
 		const EXCEPTION_NONCONTINUABLE = 1
 		mod := syscall.MustLoadDLL("kernel32.dll")
