@@ -587,6 +587,9 @@ func TestInvalidValues(t *testing.T) {
 func TestGetMUIStringValue(t *testing.T) {
 	var dtzi DynamicTimezoneinformation
 	if _, err := GetDynamicTimeZoneInformation(&dtzi); err != nil {
+		if err == syscall.ERROR_PROC_NOT_FOUND {
+			t.Skip("GetDynamicTimeZoneInformation is not available before Windows Vista")
+		}
 		t.Fatal(err)
 	}
 	tzKeyName := syscall.UTF16ToString(dtzi.TimeZoneKeyName[:])
@@ -639,6 +642,12 @@ var (
 )
 
 func GetDynamicTimeZoneInformation(dtzi *DynamicTimezoneinformation) (rc uint32, err error) {
+	// Not present before Windows Vista. LazyProc.Addr panics on a missing
+	// entry point, which would end the whole test binary rather than this
+	// one test, so report it as an error the caller can act on.
+	if procGetDynamicTimeZoneInformation.Find() != nil {
+		return 0, syscall.ERROR_PROC_NOT_FOUND
+	}
 	r0, _, e1 := syscall.Syscall(procGetDynamicTimeZoneInformation.Addr(), 1, uintptr(unsafe.Pointer(dtzi)), 0, 0)
 	rc = uint32(r0)
 	if rc == 0xffffffff {
