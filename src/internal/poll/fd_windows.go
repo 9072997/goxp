@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"sync"
 	"syscall"
+	"time"
 	"unicode/utf16"
 	"unicode/utf8"
 	"unsafe"
@@ -548,6 +549,62 @@ func (fd *FD) DisassociateIOCP() error {
 	return nil
 }
 
+// closeWaitLimit is how long Close waits for a pending operation to finish
+// before concluding that nothing will finish it. Cancelling an operation that
+// is already pending completes it promptly or not at all, so this only has to
+// outlast scheduling noise on a slow machine, not real work.
+const closeWaitLimit = 5 * time.Second
+
+// abandonedCloseMode reports what to do when Close gives up on a pending
+// operation: "warn" prints one line to stderr, "panic" stops the program, and
+// anything else is silent. Read from GOXP_ABANDONED_CLOSE.
+//
+// Silent by default because the alternative to abandoning is a hang, and a
+// program that hits this occasionally and exits loses nothing - the leak dies
+// with the process. Set it when a long-lived program is leaking threads and you
+// need to find out where.
+var abandonedCloseMode = sync.OnceValue(func() string {
+	v, _ := syscall.Getenv("GOXP_ABANDONED_CLOSE")
+	return v
+})
+
+// waitForDestroy waits for destroy to post fd.csema and reports whether it
+// arrived. It returns false only where the wait cannot be satisfied: a
+// synchronous handle on a Windows with no CancelIoEx.
+func (fd *FD) waitForDestroy() bool {
+	if !fd.isBlocking || windows.SupportCancelIoEx() {
+		// Either the operation is overlapped, and execIO's thread pinning
+		// means the cancel reaches it, or CancelIoEx exists and reaches it
+		// directly. The post always comes; wait for it as upstream does.
+		runtime_Semacquire(&fd.csema)
+		return true
+	}
+	done := make(chan struct{})
+	go func() {
+		runtime_Semacquire(&fd.csema)
+		close(done)
+	}()
+	timer := time.NewTimer(closeWaitLimit)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		// The goroutine above stays parked. That costs a goroutine, not a
+		// thread - the thread was already lost inside ReadFile.
+		return false
+	}
+}
+
+func (fd *FD) reportAbandonedClose() {
+	switch abandonedCloseMode() {
+	case "panic":
+		panic("internal/poll: Close abandoned a pending operation that cannot be cancelled on this version of Windows")
+	case "warn":
+		println("internal/poll: Close abandoned a pending operation that cannot be cancelled; leaking one handle and one thread")
+	}
+}
+
 func (fd *FD) destroy() error {
 	if fd.Sysfd == syscall.InvalidHandle {
 		return syscall.EINVAL
@@ -583,7 +640,9 @@ func (fd *FD) Close() error {
 	err := fd.decref()
 	// Wait until the descriptor is closed. If this was the only
 	// reference, it is already closed.
-	runtime_Semacquire(&fd.csema)
+	if !fd.waitForDestroy() {
+		fd.reportAbandonedClose()
+	}
 	return err
 }
 
