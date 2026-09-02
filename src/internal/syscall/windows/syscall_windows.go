@@ -257,7 +257,11 @@ var sendRecvMsgFunc struct {
 	once     sync.Once
 	sendAddr uintptr
 	recvAddr uintptr
-	err      error
+	// Separate errors: the two extension pointers are resolved
+	// independently and one can be present while the other is not.
+	// Windows XP has WSARecvMsg but not WSASendMsg.
+	sendErr error
+	recvErr error
 }
 
 type WSAMsg struct {
@@ -273,26 +277,27 @@ type WSAMsg struct {
 //sys	WSADuplicateSocket(s syscall.Handle, processID uint32, info *syscall.WSAProtocolInfo) (err error) [failretval!=0] = ws2_32.WSADuplicateSocketW
 //sys	WSAGetOverlappedResult(h syscall.Handle, o *syscall.Overlapped, bytes *uint32, wait bool, flags *uint32) (err error) = ws2_32.WSAGetOverlappedResult
 
-func loadWSASendRecvMsg() error {
+func loadWSASendRecvMsg() {
 	sendRecvMsgFunc.once.Do(func() {
 		var s syscall.Handle
-		s, sendRecvMsgFunc.err = syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, syscall.IPPROTO_UDP)
-		if sendRecvMsgFunc.err != nil {
+		var err error
+		s, err = syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, syscall.IPPROTO_UDP)
+		if err != nil {
+			// Nothing can be resolved without a socket to ask.
+			sendRecvMsgFunc.sendErr = err
+			sendRecvMsgFunc.recvErr = err
 			return
 		}
 		defer syscall.CloseHandle(s)
 		var n uint32
-		sendRecvMsgFunc.err = syscall.WSAIoctl(s,
+		sendRecvMsgFunc.recvErr = syscall.WSAIoctl(s,
 			syscall.SIO_GET_EXTENSION_FUNCTION_POINTER,
 			(*byte)(unsafe.Pointer(&WSAID_WSARECVMSG)),
 			uint32(unsafe.Sizeof(WSAID_WSARECVMSG)),
 			(*byte)(unsafe.Pointer(&sendRecvMsgFunc.recvAddr)),
 			uint32(unsafe.Sizeof(sendRecvMsgFunc.recvAddr)),
 			&n, nil, 0)
-		if sendRecvMsgFunc.err != nil {
-			return
-		}
-		sendRecvMsgFunc.err = syscall.WSAIoctl(s,
+		sendRecvMsgFunc.sendErr = syscall.WSAIoctl(s,
 			syscall.SIO_GET_EXTENSION_FUNCTION_POINTER,
 			(*byte)(unsafe.Pointer(&WSAID_WSASENDMSG)),
 			uint32(unsafe.Sizeof(WSAID_WSASENDMSG)),
@@ -300,14 +305,14 @@ func loadWSASendRecvMsg() error {
 			uint32(unsafe.Sizeof(sendRecvMsgFunc.sendAddr)),
 			&n, nil, 0)
 	})
-	return sendRecvMsgFunc.err
 }
 
 func WSASendMsg(fd syscall.Handle, msg *WSAMsg, flags uint32, bytesSent *uint32, overlapped *syscall.Overlapped, croutine *byte) error {
-	err := loadWSASendRecvMsg()
-	if err != nil {
+	loadWSASendRecvMsg()
+	if err := sendRecvMsgFunc.sendErr; err != nil {
 		return err
 	}
+	var err error
 	r1, _, e1 := syscall.Syscall6(sendRecvMsgFunc.sendAddr, 6, uintptr(fd), uintptr(unsafe.Pointer(msg)), uintptr(flags), uintptr(unsafe.Pointer(bytesSent)), uintptr(unsafe.Pointer(overlapped)), uintptr(unsafe.Pointer(croutine)))
 	if r1 == socket_error {
 		if e1 != 0 {
@@ -320,10 +325,11 @@ func WSASendMsg(fd syscall.Handle, msg *WSAMsg, flags uint32, bytesSent *uint32,
 }
 
 func WSARecvMsg(fd syscall.Handle, msg *WSAMsg, bytesReceived *uint32, overlapped *syscall.Overlapped, croutine *byte) error {
-	err := loadWSASendRecvMsg()
-	if err != nil {
+	loadWSASendRecvMsg()
+	if err := sendRecvMsgFunc.recvErr; err != nil {
 		return err
 	}
+	var err error
 	r1, _, e1 := syscall.Syscall6(sendRecvMsgFunc.recvAddr, 5, uintptr(fd), uintptr(unsafe.Pointer(msg)), uintptr(unsafe.Pointer(bytesReceived)), uintptr(unsafe.Pointer(overlapped)), uintptr(unsafe.Pointer(croutine)), 0)
 	if r1 == socket_error {
 		if e1 != 0 {
