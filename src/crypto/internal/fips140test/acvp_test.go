@@ -2106,6 +2106,18 @@ func cmdKtsIfcResponderAft(h func() hash.Hash) command {
 func TestACVP(t *testing.T) {
 	testenv.SkipIfShortAndSlow(t)
 
+	// GODEBUG=fips140=on below makes the module-wrapper subprocess call
+	// crypto/internal/fips140/check's init, which panics rather than
+	// returning an error when fips140.Supported() reports the platform
+	// can't do FIPS mode at all (see crypto/internal/fips140/fips140.go).
+	// cmd/dist/test.go's fipsSupported() already keeps this whole package
+	// out of a normal `dist test` run on such platforms; running `go test`
+	// on this package directly bypasses that, so check here too instead of
+	// spending ~90s fetching modules and building acvptool only to panic.
+	if err := fips140.Supported(); err != nil {
+		t.Skipf("skipping: %s", err)
+	}
+
 	const (
 		bsslModule    = "boringssl.googlesource.com/boringssl.git"
 		bsslVersion   = "v0.0.0-20260422110153-4ccbe2adaf4f"
