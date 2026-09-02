@@ -22,6 +22,22 @@ var pathVar string = func() string {
 	return "PATH"
 }()
 
+// hasDOSSubsystem reports whether this system still ships NTVDM, which runs
+// 16-bit DOS images. Only 32-bit Windows has it. Where it is absent -
+// 64-bit Windows, and every other operating system - CreateProcess rejects a
+// file that is not a valid executable image instead of handing it over.
+func hasDOSSubsystem() bool {
+	if runtime.GOOS != "windows" {
+		return false
+	}
+	root := os.Getenv("SystemRoot")
+	if root == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(root, "system32", "ntvdm.exe"))
+	return err == nil
+}
+
 func TestLookPath(t *testing.T) {
 	testenv.MustHaveExec(t)
 	// Not parallel: uses Chdir and Setenv.
@@ -87,6 +103,16 @@ func TestLookPath(t *testing.T) {
 						if cmd.Err != nil {
 							t.Fatalf("Command failed unexpectedly: %v", err)
 						}
+					}
+
+					if hasDOSSubsystem() {
+						// CreateProcess hands an .exe it does not recognise
+						// as a PE image to NTVDM, which starts successfully
+						// and then waits at an error dialog instead of
+						// exiting. Start therefore succeeds where ENOEXEC is
+						// expected, and Wait never returns. Everything this
+						// test is about has been checked above.
+						t.Skip("invalid .exe starts under the DOS subsystem here and never exits")
 					}
 
 					// Clearing cmd.Err should let the execution proceed,

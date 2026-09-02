@@ -1293,7 +1293,22 @@ func startHang(t *testing.T, ctx context.Context, hangTime time.Duration, interr
 	return cmd
 }
 
+func init() {
+	if !canCancelPendingIO() {
+		// TestWaitInterrupt is skipped where a pending read cannot be
+		// cancelled, and it is the only test that runs the hang helper.
+		// Leaving it registered would trip TestMain's unused-helper check.
+		delete(helperCommands, "hang")
+	}
+}
+
 func TestWaitInterrupt(t *testing.T) {
+	if !canCancelPendingIO() {
+		// WaitDelay works by abandoning a read that is already pending.
+		// Where that cannot be done, Wait blocks until the grandchild exits
+		// on its own and these subtests hang instead of failing.
+		t.Skip("WaitDelay cannot interrupt a pending read on this platform")
+	}
 	t.Parallel()
 
 	// tooLong is an arbitrary duration that is expected to be much longer than
