@@ -1317,7 +1317,9 @@ func (fd *FD) Fchmod(mode uint32) error {
 
 	var du windows.FILE_BASIC_INFO
 	du.FileAttributes = attrs
-	return windows.SetFileInformationByHandle(fd.Sysfd, windows.FileBasicInfo, unsafe.Pointer(&du), uint32(unsafe.Sizeof(du)))
+	// Not SetFileInformationByHandle directly: that is Vista and later, and
+	// this wrapper falls back to the native call it wraps where it is absent.
+	return windows.SetFileBasicInfoByHandle(fd.Sysfd, &du)
 }
 
 // Fchdir wraps syscall.Fchdir.

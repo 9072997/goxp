@@ -12,3 +12,10 @@ import "internal/syscall/windows"
 // thread, so an operation another goroutine is parked in cannot be reached at
 // all.
 func canCancelPendingIO() bool { return windows.SupportCancelIoEx() }
+
+// canStatConsoleAlias reports whether the \\.\ form of a console device name
+// can be opened. Before Vista, CreateFile refuses \\.\CONIN$ and \\.\CONOUT$
+// with ERROR_FILE_NOT_FOUND whatever access is asked for, so there is no route
+// by which os.Stat could describe them. Plain CONIN$ and CONOUT$, and both
+// forms of CON, do work there.
+func canStatConsoleAlias() bool { return windows.SupportDeviceNamesInFileAPIs() }

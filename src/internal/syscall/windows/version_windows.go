@@ -138,6 +138,18 @@ var SupportCancelIoEx = sync.OnceValue(func() bool {
 // SupportUnixSocket indicates whether the current Windows version supports
 // Unix Domain Sockets.
 // The minimal requirement is Windows 10.0.17063.
+// SupportDeviceNamesInFileAPIs reports whether the ordinary file APIs describe
+// the reserved device names such as CON and CONIN$. Before Vista they do not,
+// in two ways that matter: GetFileAttributesEx reports ERROR_FILE_NOT_FOUND
+// for them, indistinguishable from a name that really is absent; and
+// CreateFile with no access rights reports ERROR_FILE_NOT_FOUND where later
+// versions report ERROR_INVALID_PARAMETER, which is the error a caller would
+// key a retry-with-GENERIC_READ on.
+var SupportDeviceNamesInFileAPIs = sync.OnceValue(func() bool {
+	major, _, _ := Version()
+	return major >= 6 // Windows Vista
+})
+
 var SupportUnixSocket = sync.OnceValue(func() bool {
 	var size uint32
 	// First call to get the required buffer size in bytes.

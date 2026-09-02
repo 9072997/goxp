@@ -335,6 +335,12 @@ func TestStatConsole(t *testing.T) {
 			lstatCheck: testIsFile,
 		}
 		testStatAndLstat(t, name, params)
+		if name != "CON" && !canStatConsoleAlias() {
+			// CreateFile refuses the \\.\ form of CONIN$ and CONOUT$ on
+			// this system whatever access is asked for, so there is no route
+			// by which Stat could describe them. \\.\CON does work.
+			continue
+		}
 		testStatAndLstat(t, `\\.\`+name, params)
 	}
 }

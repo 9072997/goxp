@@ -35,7 +35,11 @@ func stat(funcname, name string, followSurrogates bool) (FileInfo, error) {
 	// See https://golang.org/issues/19922#issuecomment-300031421 for details.
 	var fa syscall.Win32FileAttributeData
 	err = syscall.GetFileAttributesEx(namep, syscall.GetFileExInfoStandard, (*byte)(unsafe.Pointer(&fa)))
-	if errors.Is(err, ErrNotExist) {
+	if errors.Is(err, ErrNotExist) && windows.SupportDeviceNamesInFileAPIs() {
+		// Where this call cannot describe a console device, a not-exist
+		// answer does not mean the name is absent, so fall through to
+		// CreateFile below rather than trusting it. A name that really is
+		// absent fails there too and still returns a not-exist error.
 		return nil, &PathError{Op: "GetFileAttributesEx", Path: name, Err: err}
 	}
 	if err == nil && fa.FileAttributes&syscall.FILE_ATTRIBUTE_REPARSE_POINT == 0 {
@@ -74,11 +78,17 @@ func stat(funcname, name string, followSurrogates bool) (FileInfo, error) {
 	var flags uint32 = syscall.FILE_FLAG_BACKUP_SEMANTICS | syscall.FILE_FLAG_OPEN_REPARSE_POINT
 	h, err := syscall.CreateFile(namep, 0, 0, nil, syscall.OPEN_EXISTING, flags, 0)
 
-	if err == windows.ERROR_INVALID_PARAMETER {
+	if err == windows.ERROR_INVALID_PARAMETER ||
+		(err != nil && !windows.SupportDeviceNamesInFileAPIs() && errors.Is(err, ErrNotExist)) {
 		// Console handles, like "\\.\con", require generic read access. See
 		// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew#consoles.
 		// We haven't set it previously because it is normally not required
 		// to read attributes and some files may not allow it.
+		//
+		// Before Vista that refusal arrives as ERROR_FILE_NOT_FOUND rather
+		// than ERROR_INVALID_PARAMETER, so retry on that too where these
+		// APIs cannot see device names. A name that really is absent fails
+		// the retry as well and still ends up a not-exist error.
 		h, err = syscall.CreateFile(namep, syscall.GENERIC_READ, 0, nil, syscall.OPEN_EXISTING, flags, 0)
 	}
 	if err != nil {

@@ -10,3 +10,8 @@ package os_test
 // progress can be cancelled from another goroutine. Everywhere but old Windows
 // closing the descriptor is enough to interrupt it.
 func canCancelPendingIO() bool { return true }
+
+// canStatConsoleAlias reports whether the \\.\ form of a console device name
+// can be opened. Console device names are a Windows concept; elsewhere this
+// question does not arise and the tests that ask it do not run.
+func canStatConsoleAlias() bool { return true }
