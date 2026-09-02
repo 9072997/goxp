@@ -41,6 +41,11 @@ func isWindowsRetryable(err error) bool {
 // can be removed.
 type highPrecisionTime struct {
 	now int64
+	// wall is a fallback for when the counter cannot be trusted, which
+	// happens on XP where it is read from each core's TSC. It carries a
+	// monotonic reading, so subtracting two of them is safe even when the
+	// counter is not.
+	wall time.Time
 }
 
 // highPrecisionTimeNow returns high precision time for benchmarking.
@@ -48,6 +53,7 @@ func highPrecisionTimeNow() highPrecisionTime {
 	var t highPrecisionTime
 	// This should always succeed for Windows XP and above.
 	t.now = windows.QueryPerformanceCounter()
+	t.wall = time.Now()
 	return t
 }
 
@@ -61,17 +67,17 @@ func (a highPrecisionTime) sub(b highPrecisionTime) time.Duration {
 		// because a negative delta becomes a near-2^64 unsigned one and
 		// bits.Div64 overflows its quotient.
 		//
-		// Reporting no elapsed time is a better answer than a panic, and on a
-		// machine whose counter really is monotonic this branch never runs.
-		return 0
+		// The monotonic clock is coarser but always moves forward, so it
+		// gives a true answer where the counter gives an impossible one.
+		return a.wall.Sub(b.wall)
 	}
 
 	if queryPerformanceFrequency == 0 {
 		queryPerformanceFrequency = windows.QueryPerformanceFrequency()
 		if queryPerformanceFrequency == 0 {
-			// bits.Div64 panics on a zero divisor. There is nothing to scale
-			// by, so report no elapsed time, as above.
-			return 0
+			// bits.Div64 panics on a zero divisor. With nothing to scale
+			// by, fall back to the monotonic clock, as above.
+			return a.wall.Sub(b.wall)
 		}
 	}
 	hi, lo := bits.Mul64(uint64(delta), uint64(time.Second)/uint64(time.Nanosecond))
@@ -82,7 +88,7 @@ func (a highPrecisionTime) sub(b highPrecisionTime) time.Duration {
 		// panics when y <= hi, and a quotient that large means more than 2^64
 		// nanoseconds - about 584 years - so this is a bad reading and not a
 		// long interval.
-		return 0
+		return a.wall.Sub(b.wall)
 	}
 	quo, _ := bits.Div64(hi, lo, uint64(queryPerformanceFrequency))
 	return time.Duration(quo)
