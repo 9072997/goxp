@@ -2007,6 +2007,11 @@ func TestPipeReadTimeout(t *testing.T) {
 }
 
 func TestPipeCanceled(t *testing.T) {
+	if !canCancelPendingIO() {
+		// The test cancels a pending read from another goroutine. Where that
+		// cannot be done the read never returns and the test hangs.
+		t.Skip("cannot cancel an operation already pending on this platform")
+	}
 	t.Parallel()
 	name := pipeName()
 	_ = newBytePipe(t, name, true)

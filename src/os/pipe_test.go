@@ -165,6 +165,14 @@ func TestStdPipe(t *testing.T) {
 }
 
 func testClosedPipeRace(t *testing.T, read bool) {
+	if !canCancelPendingIO() {
+		// The whole point of the test is that closing the descriptor
+		// interrupts a call already blocked on it. Where a pending
+		// operation cannot be cancelled, the blocked call waits for data
+		// that never arrives and the test hangs rather than failing.
+		t.Skip("cannot cancel an operation already pending on this platform")
+	}
+
 	// This test cannot be run in parallel due to the same race as for TestEPIPE.
 	// (We expect a write to a closed pipe can fail, but a concurrent fork of a
 	// child process can cause the pipe to unexpectedly remain open.)
