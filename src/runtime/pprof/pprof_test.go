@@ -637,6 +637,14 @@ func TestCPUProfileWithFork(t *testing.T) {
 		// Use smaller size for Android to avoid crash.
 		heap = 100 << 20
 	}
+	if ^uintptr(0)>>32 == 0 {
+		// A 32-bit process has about 2GB of user address space, so this is
+		// half of it, and it is not reclaimed before the next test allocates.
+		// Measured on windows/386: this test followed by TestMathBigDivide
+		// reaches the ceiling and the process dies with "out of memory".
+		// Same reason as the Android case above.
+		heap = 100 << 20
+	}
 	if testing.Short() {
 		heap = 100 << 20
 	}
