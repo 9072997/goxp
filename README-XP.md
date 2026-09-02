@@ -452,17 +452,30 @@ described above. Nothing else in the suite disagrees between XP and Windows 11.
 
 ## Known unfixed
 
-- `CancelIoEx` has no XP equivalent. The fallback is `CancelIo`, which only
-  cancels I/O issued by the calling thread, so a read blocked past its deadline
-  may not be interrupted if the goroutine migrated.
-- `os.SameFile` is false for directory entries, because
-  `GetFinalPathNameByHandle` is Vista+ and there is no path to open.
+- `CancelIoEx` has no XP equivalent, and this is the root of most of what
+  follows. The fallback is `CancelIo`, which only cancels I/O issued by the
+  calling thread — no use when that thread is itself parked inside `ReadFile`.
+  `execIO` now pins a goroutine to its thread so `CancelIo` can at least reach
+  the operations it is able to, and `Close` gives up after five seconds rather
+  than waiting forever on a completion that cannot arrive, leaking the handle
+  and thread instead of hanging. Set `GOXP_ABANDONED_CLOSE=warn` (or `panic`)
+  to find out when that happens.
+- `Cmd.WaitDelay` does not bound `Wait` when a grandchild inherits the child's
+  output pipe. WaitDelay works by abandoning the pending read, which is the one
+  thing XP cannot do, so `Wait` blocks until the grandchild exits on its own.
+- `CreateProcess` does not reject a file that is not a valid PE image. 32-bit
+  Windows hands it to NTVDM, the DOS subsystem, which starts successfully and
+  then waits at an error dialog. So starting a corrupt `.exe` returns no error
+  and the resulting process never exits, where 64-bit Windows fails cleanly
+  with `ERROR_BAD_EXE_FORMAT`.
 - Symbolic links cannot be created with `os.Symlink` or followed by anything but
   `os.Root`, and deleting or renaming over a file that is still open is deferred
   rather than immediate. Both are detailed under "os.Root on XP".
 
-Neither of the first two is a regression — the Go 1.21 XP backports have the
-same holes.
+None of these is a regression against the Go 1.21 XP backports, which have the
+same holes or worse. `os.SameFile` was in this list and is not any more: it now
+takes the volume serial from `GetFileInformationByHandle` and the path from the
+`NtQueryObject` shim, and answers correctly for directory entries.
 
 Patching the standard library makes *this* toolchain's own programs work. It
 does not make every Go program work: anything leaning on symlink resolution or
