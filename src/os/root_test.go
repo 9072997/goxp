@@ -65,11 +65,19 @@ func makefs(t *testing.T, fs []string) string {
 		ent = strings.ReplaceAll(ent, "$ABS", root)
 		base, link, isLink := strings.Cut(ent, " => ")
 		if isLink {
+			// testenv.MustHaveSymlink itself calls t.Skip, but it's meant
+			// for use at the top of a test, and reports the failure against
+			// the wrong line (this call, not the fixture entry) if used
+			// here; call the probe directly instead. This matters on
+			// Windows: CreateSymbolicLinkW is Vista and later, so this skip
+			// is the difference between "XP measurably cannot build this
+			// fixture" and every TestRootMulti* subtest that touches a
+			// symlink failing with a bare "The request is not supported."
+			if !testenv.HasSymlink() {
+				t.Skip("symlinks not supported on " + runtime.GOOS + "/" + runtime.GOARCH)
+			}
 			if runtime.GOOS == "wasip1" && path.IsAbs(link) {
 				t.Skip("absolute link targets not supported on " + runtime.GOOS)
-			}
-			if runtime.GOOS == "plan9" {
-				t.Skip("symlinks not supported on " + runtime.GOOS)
 			}
 			ent = base
 		}
@@ -2780,8 +2788,14 @@ func (desc testFileDesc) create(t *testing.T, dir, base, token string) (fi os.Fi
 		}
 	case testFileSymlink:
 		// Symlink. We create a symlink target named "s_"+base.
-		if runtime.GOOS == "plan9" {
-			t.Skip("symlinks not supported on " + runtime.GOOS)
+		//
+		// testenv.HasSymlink actually probes os.Symlink rather than just
+		// checking runtime.GOOS, which is what catches Windows XP:
+		// CreateSymbolicLinkW is Vista and later, so plain "windows" is not
+		// enough to know a symlink can be made here. See also makefs above,
+		// which has the same guard for the same reason.
+		if !testenv.HasSymlink() {
+			t.Skip("symlinks not supported on " + runtime.GOOS + "/" + runtime.GOARCH)
 		}
 		linktarget := desc.target.ref.path(dir, "s_"+base)
 		if runtime.GOOS == "wasip1" && filepath.IsAbs(linktarget) {
@@ -2869,6 +2883,20 @@ func dirTreeContents(t *testing.T, dir string) (contents []string) {
 				ent += " (unreadable)"
 			} else {
 				content, err := io.ReadAll(f)
+				// Close before checking the read error (and before the
+				// t.Fatal below) rather than deferring: this runs inside a
+				// fs.WalkDir callback, invoked once per file, and dirTreeContents
+				// itself is called at least twice per subtest (initial and
+				// final contents). Leaving these handles open until the
+				// walk finishes used to leak one per file for the rest of
+				// the test; on platforms without POSIX delete semantics
+				// (Windows, and XP in particular, which has none at all)
+				// that leak makes t.TempDir()'s own cleanup fail to remove
+				// the directory, since a file with any handle still open
+				// can't be deleted. Measured on XP: 258 TestRootMulti
+				// subtests failed in cleanup for exactly this reason before
+				// this fix.
+				f.Close()
 				if err != nil {
 					t.Fatal(err)
 				}

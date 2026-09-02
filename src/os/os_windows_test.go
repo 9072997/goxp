@@ -1216,6 +1216,38 @@ func replaceDriveWithVolumeID(t *testing.T, path string) string {
 	return filepath.Join(vol, path[len(filepath.VolumeName(path)):])
 }
 
+// createJunctionAt creates a directory junction at link pointing to target,
+// using FSCTL_SET_REPARSE_POINT directly instead of shelling out to
+// "mklink /J". mklink is a cmd.exe built-in that arrived with Vista; it does
+// not exist on XP ('mklink' is not recognized as an internal or external
+// command). FSCTL_SET_REPARSE_POINT is an NT 4-era primitive and works
+// identically on both, so junctions can be created without it — see
+// createMountPoint and TestDirectoryJunction's "standard" case, which does
+// the same thing for the same reason.
+//
+// target may be relative (resolved against the current directory, matching
+// what mklink itself would do), an absolute drive-letter path, or a
+// \\?\Volume{GUID}\... path; all three forms mklink accepts are handled.
+func createJunctionAt(t *testing.T, link, target string) {
+	t.Helper()
+	sub := target
+	if strings.HasPrefix(sub, `\\?\`) {
+		sub = `\??\` + sub[4:]
+	} else {
+		abs, err := filepath.Abs(sub)
+		if err != nil {
+			t.Fatalf("resolving junction target %#q: %v", target, err)
+		}
+		sub = `\??\` + abs
+	}
+	var rd reparseData
+	rd.addSubstituteName(sub)
+	rd.addPrintName(sub[4:])
+	if err := createMountPoint(link, &rd); err != nil {
+		t.Fatalf("createMountPoint(%#q, %#q): %v", link, sub, err)
+	}
+}
+
 func TestReadlink(t *testing.T) {
 	tests := []struct {
 		junction bool
@@ -1305,10 +1337,7 @@ func TestReadlink(t *testing.T) {
 				}
 			}
 			if tt.junction {
-				cmd := testenv.Command(t, "cmd", "/c", "mklink", "/J", link, target)
-				if out, err := cmd.CombinedOutput(); err != nil {
-					t.Fatalf("%v: %v\n%s", cmd, err, out)
-				}
+				createJunctionAt(t, link, target)
 			} else {
 				if err := os.Symlink(target, link); err != nil {
 					t.Fatalf("Symlink(%#q, %#q): %v", target, link, err)
@@ -2055,7 +2084,45 @@ func iocpAssociateFile(f *os.File, iocp syscall.Handle) error {
 	return err
 }
 
+// canReassociateIOCP reports whether a file handle that is already
+// associated with one I/O completion port (as every overlapped os.File is,
+// with the runtime's own internal IOCP, from the moment it's opened) can be
+// associated with a second, different IOCP the way iocpAssociateFile does.
+//
+// Windows 8 added FileReplaceCompletionInformation for this; before that,
+// CreateIoCompletionPort's documented behavior for a handle that already has
+// an association is to fail rather than move it. Measured directly (not
+// guessed) on Windows XP SP3: a handle's first-ever association always
+// succeeds; a second association of that same handle, to a second IOCP,
+// fails every time with ERROR_INVALID_PARAMETER ("The parameter is
+// incorrect") -- both when the first association was made explicitly via
+// CreateIoCompletionPort and when it was made implicitly by opening the
+// file as overlapped, which is what os.OpenFile does and why this probe
+// reuses iocpAssociateFile itself rather than a hand-rolled variant.
+var canReassociateIOCP = sync.OnceValue(func() bool {
+	name := filepath.Join(os.TempDir(), fmt.Sprintf("iocp-reassoc-probe-%d", os.Getpid()))
+	f, err := os.OpenFile(name, os.O_CREATE|os.O_RDWR|windows.O_FILE_FLAG_OVERLAPPED, 0600)
+	if err != nil {
+		// Can't run the probe; don't fail the whole suite over an unrelated
+		// problem, and let the real test's own setup surface it instead.
+		return true
+	}
+	defer os.Remove(name)
+	defer f.Close()
+
+	iocp, err := windows.CreateIoCompletionPort(syscall.InvalidHandle, 0, 0, 0)
+	if err != nil {
+		return true
+	}
+	defer syscall.CloseHandle(iocp)
+
+	return iocpAssociateFile(f, iocp) == nil
+})
+
 func TestFileAssociatedWithExternalIOCP(t *testing.T) {
+	if !canReassociateIOCP() {
+		t.Skip("cannot associate a handle with a second I/O completion port on this platform (see canReassociateIOCP)")
+	}
 	// Test that a caller can associate an overlapped handle to an external IOCP
 	// after the handle has been passed to os.NewFile.
 	// Also test that the File can perform I/O after it is associated with the
@@ -2130,6 +2197,9 @@ func TestFileAssociatedWithExternalIOCP(t *testing.T) {
 }
 
 func TestFileWriteFdRace(t *testing.T) {
+	if !canReassociateIOCP() {
+		t.Skip("cannot associate a handle with a second I/O completion port on this platform (see canReassociateIOCP)")
+	}
 	t.Parallel()
 
 	f := newFileOverlapped(t, filepath.Join(t.TempDir(), "a"), true)
@@ -2348,6 +2418,31 @@ func TestOpenFileTruncateNamedPipe(t *testing.T) {
 
 func TestNewFileStdinBlocked(t *testing.T) {
 	// See https://go.dev/issue/75949.
+	if !canCancelPendingIO() {
+		// This test's whole premise -- a subprocess that inherits a pipe
+		// handle with a synchronous read already pending on it from another
+		// process -- does not work on this platform.
+		//
+		// Measured (not guessed): with the parent's blocking Read removed,
+		// the child starts and exits immediately; with it present, the
+		// child never executes a single instruction of user code. Running
+		// the child with GODEBUG=inittrace=1 and its stdout/stderr
+		// redirected to a file shows the file staying empty across the
+		// whole hang -- not even "init runtime @0ms", the very first line
+		// inittrace ever prints, appears. So the child isn't stuck inside
+		// package os's Stdin initialization the way the issue this test
+		// guards against describes; it never reaches Go code at all. That
+		// points at the NT kernel serializing access to the file object
+		// while the parent's synchronous ReadFile is outstanding on a
+		// different handle to the same object, something CreateProcess's
+		// handle inheritance runs into before the child's entry point is
+		// called. There is nothing a test change (or an os package change)
+		// can do about a stall that happens before the child's first
+		// instruction runs, and CancelIoEx -- unavailable here, see
+		// canCancelPendingIO -- is exactly what upstream relies on to keep
+		// this scenario from arising in the first place.
+		t.Skip("cannot start a process that inherits a handle with a pending cross-process read on this platform")
+	}
 	t.Parallel()
 
 	// Use a subprocess to test that os.NewFile on a blocked stdin works.
