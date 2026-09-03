@@ -3,7 +3,7 @@
 Go 1.27.0 that produces binaries Windows XP (NT 5.1) will load and run.
 
     Base:   thongtech/go-legacy-win7 @ 1b73f848   (Go 1.27.0, targets Win7 / PE 6.1)
-    Delta:  8 files, +247 / -73                   (takes it back to XP / PE 5.1)
+    Delta:  59 files, +5628 / -217                (takes it back to XP / PE 5.1)
             + a root-certificate fallback         (see "HTTPS on XP" below)
             + os.Root.RemoveAll restored          (see "os.Root.RemoveAll" below)
             + os.Root made to work at all         (see "os.Root on XP" below)
@@ -42,7 +42,7 @@ Two different questions, and passing the first says nothing about the second.
 than 6.1. An official toolchain and this one print the same `go version`
 string, so check the artifact:
 
-    go run scripts/checkpe.go your.exe        # from the picoclaw tree
+    go run scripts/checkpe.go your.exe        # a companion tool, not included here
 
 **Will it actually start?** The loader resolves every static import before main
 runs, so a binary it accepts still dies if the import table names something
@@ -152,8 +152,9 @@ intent the API does not express. Ordering the verifiers deletes the question.
   and never has. Go does no revocation checking either. A revoked certificate
   was accepted before this change and is accepted after it, by both paths.
 
-`scripts/certprobe.go` in the picoclaw tree prints the platform verifier's bits
-from a live connection, which is how the measurements above were established.
+A companion tool not included here, `certprobe`, prints the platform verifier's
+bits from a live connection, which is how the measurements above were
+established.
 
 Programs no longer need their own copy of the bundle, and none of this changes
 behaviour on any other GOOS: `linux/386` binaries are byte-identical with and
