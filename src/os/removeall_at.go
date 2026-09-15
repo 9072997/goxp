@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build unix || wasip1
+//go:build unix || wasip1 || windows
 
 package os
 
@@ -83,6 +83,7 @@ func removeAllFrom(parentFd sysfdType, base string) error {
 
 	// Remove the directory's entries.
 	var recurseErr error
+Walk:
 	for {
 		const reqSize = 1024
 		var respSize int
@@ -113,6 +114,18 @@ func removeAllFrom(parentFd sysfdType, base string) error {
 			if readErr != nil && readErr != io.EOF {
 				file.Close()
 				if IsNotExist(readErr) {
+					if runtime.GOOS == "windows" {
+						// A descriptor reporting its own directory gone means
+						// the directory is gone, but a Windows listing is not
+						// always by handle: File.readdir's last resort, for a
+						// file system that will not list a directory by handle,
+						// resolves the directory by name, and a name that no
+						// longer resolves gives ERROR_PATH_NOT_FOUND. Stop
+						// listing and let removedirat answer instead: it
+						// succeeds if the directory has gone, and fails with
+						// ENOTEMPTY if it has not.
+						break Walk
+					}
 					return nil
 				}
 				return &PathError{Op: "readdirnames", Path: base, Err: readErr}

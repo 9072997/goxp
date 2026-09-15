@@ -1,13 +1,17 @@
 # goxp — Go for Windows XP
 
-Go 1.27.0 that produces binaries Windows XP (NT 5.1) will load and run.
+Go 1.27.1 that produces binaries Windows XP (NT 5.1) will load and run.
 
-    Base:   thongtech/go-legacy-win7 @ 1b73f848   (Go 1.27.0, targets Win7 / PE 6.1)
-    Delta:  63 files, +6640 / -234                (takes it back to XP / PE 5.1)
+    Base:   thongtech/go-legacy-win7 v1.27.1-1 @ 2f6cdc24   (Go 1.27.1, targets Win7 / PE 6.1)
+    Delta:  58 files, +6373 / -212                (takes it back to XP / PE 5.1)
             + a root-certificate fallback         (see "HTTPS on XP" below)
-            + os.Root.RemoveAll restored          (see "os.Root.RemoveAll" below)
             + os.Root made to work at all         (see "os.Root on XP" below)
             + directories listed by handle        (see "Directory listing on XP" below)
+
+The base is merged, not rebased: `go1.27.1-xp` is the XP line with
+`v1.27.1-1` merged into it, and "Merging the base" below says what that merge
+had to reconcile. The hardware measurements recorded in this file were taken
+on XP builds from before that merge.
 
 Upstream Go dropped Windows XP after 1.10. `go-legacy-win7` restores Windows 7;
 this restores XP on top of it, which is a further set of problems because Go has
@@ -187,76 +191,37 @@ to 8,872,448 bytes on `windows/386`, +2.2%). Refresh it by regenerating
 
 ## os.Root.RemoveAll
 
-The base fork's commit c0f79a96 "Use removeall_noat variant on Windows" moved
-Windows off `removeall_at.go`, which is right — the `_at` walk wants
-openat/unlinkat-shaped syscalls — but it deleted `Root.RemoveAll` and *both*
-`rootRemoveAll` implementations along with it instead of writing a Windows one.
-The result was a toolchain whose `os.Root` was missing a method upstream Go
-1.25 shipped and `api/go1.25.txt` still lists: user code calling
-`root.RemoveAll` failed to compile, and `go test os` failed to build.
+`Root.RemoveAll` and the package-level `RemoveAll` are one handle-relative walk
+on Windows, the `removeAllFrom` in `removeall_at.go`, as in upstream Go. Every
+syscall in it is issued against an open directory handle with a single path
+component, and it descends only through handles opened with `O_NOFOLLOW_ANY`,
+so a link met mid-walk is deleted as a link and never followed. On XP
+`O_NOFOLLOW_ANY` is honoured by a different mechanism, described under
+"os.Root on XP"; the guarantee it makes is the same one.
 
-Restored here in four pieces:
+Two things make that walk correct on XP.
 
-| File | Change |
-|---|---|
-| `src/os/root.go` | the `Root.RemoveAll` method, upstream doc comment and all |
-| `src/os/root_removeall_at.go` | `rootRemoveAll` for `unix \|\| wasip1`, upstream's, calling `removeAllFrom` (adapted only to this tree's `doInRoot` signature) |
-| `src/os/root_removeall_windows.go` | a new handle-relative walk for Windows |
-| `src/os/root_noopenat.go` | `rootRemoveAll` for js/wasm and plan9, plus the `syscall` import c0f79a96 dropped while leaving two uses behind |
-
-Windows cannot use either deleted implementation. The `root_openat.go` one
-calls `removeAllFrom`, which lives in the `removeall_at.go` that commit turned
-off for Windows; the `root_noopenat.go` one calls `checkPathEscapesLstat`,
-which only exists on js and plan9. So Windows gets its own, modelled on
-`removeAllFrom` but built from the `*at` primitives `root_windows.go` already
-has: `removefileat`, `removedirat`, `rootOpenDir`.
-
-**Why it cannot walk out of the root.** Every syscall in the walk is issued
-against an open directory handle with a single path component — never a path,
-never `..`. `doInRoot` resolves the caller's path to (parent handle, leaf) and
-rejects anything that escapes; from there the recursion only ever descends
-through handles it opened itself with `O_NOFOLLOW_ANY`, so a reparse point
-cannot be traversed: `rootOpenDir` fails on it rather than following it. (On XP
-`O_NOFOLLOW_ANY` is honoured by a different mechanism, described under "os.Root
-on XP" below; the guarantee it makes is the same one.) A
-symlink met mid-walk is therefore deleted as a link and never followed, whether
-it points inside the root or outside it — the same thing upstream's
-`removeAllFrom` does. Deletion uses `FILE_OPEN_REPARSE_POINT` for the same
-reason. An attacker who swaps a directory for a symlink between two steps
-changes nothing: the next `rootOpenDir` on that handle returns `errSymlink`,
-the walk stops descending, and `removedirat` removes the link itself.
-
-The directory listings in the walk are by handle too, XP included (see
-"Directory listing on XP"). The one thing resolved by *path* is the name given
-to the `*File` wrapping each directory handle, and `File.readdir` lists by that
-name only in its last resort, for a file system that refuses to list a
-directory by handle at all. Even then, the names it produced would be deleted
+**It lists by handle.** The walk wraps each directory handle in a `*File` named
+only by the entry's base name, so a listing that resolved the directory by name
+would list a directory of that name relative to the current directory instead.
+`File.readdir` lists by handle, XP included (see "Directory listing on XP").
+Only its last resort, for a file system that refuses to list a directory by
+handle at all, uses that name, and even then every name it produced is deleted
 relative to the correct parent handle, so the blast radius is a spurious
 `ENOTEMPTY`, not a deletion outside the root.
 
-**Edge cases**, matching upstream and pinned by the tests already in
-`root_test.go`: trailing separators are stripped, so `RemoveAll("file/")`
-succeeds; `RemoveAll(".")` is `EINVAL`; a missing target is success; an
-intermediate component that is not a directory is success. That last one is
-mapped explicitly on Windows (`ENOTDIR` → `nil`), because here `Root.RemoveAll`
-is the `_at` walk while the package-level `RemoveAll` is the `noat` one, and
-`TestRootConsistencyRemoveAll` compares the two.
+**An unlistable directory is not reported as deleted.** When `Readdirnames`
+fails during the walk, upstream's `removeAllFrom` returns success if the error
+satisfies `IsNotExist`, on the reasoning that a descriptor reporting its own
+directory gone means the directory is gone. On Windows the last-resort listing
+resolves a name, and a name that does not resolve gives `ERROR_PATH_NOT_FOUND`,
+which `IsNotExist` accepts. So on Windows that error stops the listing and falls
+through to `removedirat`, which succeeds if the directory really has gone and
+returns `ENOTEMPTY` if it has not.
 
-`go test os` passes apart from the pre-existing `TestFileReadDir` failure noted
-under "Known unfixed".
-
-**One correctness fix over upstream's shape.** When `Readdirnames` fails during
-the walk, upstream's `removeAllFrom` returns success if the error satisfies
-`IsNotExist`, on the reasoning that a descriptor reporting its own directory
-gone means the directory is gone. This listing is not always handle-based:
-`File.readdir`'s last resort, for a file system that will not list a directory
-by handle, resolves the directory *by name* with `FindFirstFile`, and a name that
-no longer resolves gives `ERROR_PATH_NOT_FOUND` — which `IsNotExist` accepts.
-The same error therefore no longer establishes what upstream reads it as, so
-here it stops the listing and falls through to `removedirat`, which answers the
-question properly: it succeeds if the directory really has gone and returns
-`ENOTEMPTY` if it has not. Claiming to have deleted files that are still on disk
-is a worse failure than an honest `ENOTEMPTY`.
+| File | Change |
+|---|---|
+| `src/os/removeall_at.go` | on Windows, an `IsNotExist` listing error ends the listing rather than the walk |
 
 ## os.Root on XP
 
@@ -292,7 +257,10 @@ with the attribute and once without, and concludes the attribute is unsupported
 only when the flagged open is refused as invalid and the unflagged one is not.
 Every ambiguous answer resolves towards "supported", which is the stricter path.
 No version number is consulted, so Wine, ReactOS and Server 2003 each get the
-answer that is true of them.
+answer that is true of them. The probe decides once, before the first open, so
+no open has to fail first to teach it; `TestOpenatNoObjDontReparse` forces the
+substitute below on any Windows, and `ObjDontReparseUnsupportedForTest` reports
+the probe's answer.
 
 **Containment is kept, not traded away.** Dropping `OBJ_DONT_REPARSE` and
 opening normally would have made `os.Root` work while letting a junction lead
@@ -338,19 +306,20 @@ which were measured working on XP SP3. `SetFileBasicInfoByHandle` and
 `setFileDispositionByHandle` use the Win32 call where it exists and the native
 one it wraps where it does not, chosen by `procSetFileInformationByHandle.Find()`.
 `FILE_BASIC_INFO` and `FILE_BASIC_INFORMATION` have the same 40-byte layout, so
-the same struct serves both. This also fixes `Root.Chmod`, which went through
-`SetFileInformationByHandle` too and silently did nothing whenever an attribute
-actually needed changing.
+the same struct serves both. `Root.Chmod`, `File.Chmod`, and every step of the
+delete fallback that sets information on a handle go through them: clearing a
+read-only bit, marking the file for deletion, and marking for deletion the copy
+that `Renameat`'s fallback moves aside when it replaces a rename target. Called
+directly, `SetFileInformationByHandle` reports `ERROR_NOT_SUPPORTED` on XP, and
+that last one would leave the moved copy in the temporary directory for good.
 
-**`ReOpenFile` is not on XP**, despite being documented as XP and later — it
-arrived with Server 2003. `deleteatFallback` calls it to get write-attributes
-access before clearing a read-only bit, and because `LazyProc.Addr` *panics*
-rather than returning an error, `Root.Remove` of a read-only file took the whole
-process down. It is now guarded like the other five, and `reopenFileHandle`
-falls back to what `ReOpenFile` is itself implemented as: an `NtOpenFile` of the
-empty name relative to the handle, the NT idiom for "this same file again".
-That reaches the file by handle rather than by name, so nothing can be
-substituted underneath it.
+**`ReOpenFile` is not on XP**, despite being documented as XP and later: it
+arrived with Server 2003, and `LazyProc.Addr` *panics* on a missing entry point
+rather than returning an error. It is guarded like the other five and reports
+`ERROR_NOT_SUPPORTED`. Nothing in `os.Root` calls it: the delete fallback gets
+write-attributes access by opening the name again relative to the parent
+handle, and clears the read-only bit only if the file it opened is the one it
+is deleting, by volume serial and file index.
 
 **The reparse tag had no pre-Vista source.** `newFileStatFromGetFileInformationByHandle`
 reads it with `GetFileInformationByHandleEx(FileAttributeTagInfo)`, so on XP
@@ -364,12 +333,11 @@ well, not only `Root.Lstat`.
 
 | File | Change |
 |---|---|
-| `src/internal/syscall/windows/at_windows.go` | the `OBJ_DONT_REPARSE` probe and its `FILE_OPEN_REPARSE_POINT` substitute; native `FileBasicInformation`/`FileDispositionInformation`; `reopenFileHandle` |
+| `src/internal/syscall/windows/at_windows.go` | the `OBJ_DONT_REPARSE` probe and its `FILE_OPEN_REPARSE_POINT` substitute; native `FileBasicInformation`/`FileDispositionInformation`, used by the delete and rename fallbacks |
 | `src/internal/syscall/windows/zsyscall_windows.go` | a sixth `.Find()` guard, on `ReOpenFile` |
 | `src/os/types_windows.go` | reparse tag via `FSCTL_GET_REPARSE_POINT` when `GetFileInformationByHandleEx` is absent |
 | `src/os/file_windows.go` | `readReparseTagHandle` |
 | `src/os/root_windows.go` | `chmodat` through `SetFileBasicInfoByHandle` |
-| `src/os/root_removeall_windows.go` | stop reporting success on an unlistable directory |
 | `src/testing/testing_windows.go` | tolerate a `QueryPerformanceCounter` that runs backwards |
 
 That last one is not about `os.Root`, but it is what stood between the change
@@ -455,10 +423,11 @@ described above. Nothing else in the suite disagrees between XP and Windows 11.
 
 `File.readdir` reads a directory from its handle on every Windows version. It
 is what `os.ReadDir`, `File.ReadDir`, `Readdir`, `Readdirnames`, `fs.ReadDir` on
-`os.DirFS` and `Root.FS`, and `Root.RemoveAll`'s walk all list with. Go's own
-reader uses `GetFileInformationByHandleEx`, which is Vista. Where that call is
-missing, or refuses `FileFullDirectoryRestartInfo` as very old SMB shares do,
-this fork calls `NtQueryDirectoryFile` on the same handle. It is an NT 3.1
+`os.DirFS` and `Root.FS`, and the `RemoveAll` walk all list with. Go's own
+reader uses `GetFileInformationByHandleEx`, which is Vista, with
+`FileFullDirectoryRestartInfo`, and falls back to `FileIdBothDirectoryRestartInfo`
+where the kernel predates the first. Where the call is missing, or refuses both
+classes, this fork calls `NtQueryDirectoryFile` on the same handle. It is an NT 3.1
 system call, and XP's ntdll exports it.
 
 Listing by handle is what keeps an `os.Root` listing inside the root. Take a
@@ -520,7 +489,6 @@ and there `os.SameFile` reports false for such a path.
 | `src/internal/syscall/windows/syscall_windows.go` | `NtQueryDirectoryFile`, `FILE_BOTH_DIR_INFORMATION`, six status codes |
 | `src/internal/syscall/windows/zsyscall_windows.go` | the `NtQueryDirectoryFile` binding, with a `.Find()` guard |
 | `src/internal/syscall/windows/at_windows.go` | `ReopenDirectoryForListing` |
-| `src/os/root_removeall_windows.go` | comments |
 | `src/os/dir_windows_test.go` | the tests below |
 
 `FILE_BOTH_DIR_INFORMATION`'s `ShortNameLength` is one byte, so `FileName` is at
@@ -566,6 +534,28 @@ tests that do not apply to Windows. That includes `TestFileReadDir` and
 by `os.SameFile`, the latter's 200-character name included, and
 `TestSameFileLongPath`.
 
+## Merging the base
+
+`v1.27.1-1` brings Go 1.27.1 and a set of Windows 7 fixes, several of which
+reach the same code as the XP patches: a Windows 7 kernel lacks many of the
+same things an XP one does. Where the two answer the same question, this tree
+keeps one answer, and says which.
+
+| Area | `v1.27.1-1` | This tree |
+|---|---|---|
+| PE stamp, `cmd/link/internal/ld/pe.go` | 6.1, with a test that checks it | 5.1; `TestPEMinimumTargetVersion` checks 5.1 |
+| Kernels without `OBJ_DONT_REPARSE`, `Openat` | learns it from the first open refused with `STATUS_INVALID_PARAMETER`, retried | the `\??\NUL` probe decides before the first open; the base's test hooks report and force it |
+| Delete fallback, `deleteatFallback` | reopens the name to clear a read-only bit, and moves a file aside so its name goes at once | the same, with every set-information call through the XP wrappers |
+| Rename over a held or linked target, `Renameat` | moves the target aside, renames, deletes the moved copy | the same, with the delete through the XP wrapper; a directory link as target is left alone on XP, where its tag cannot be read that way |
+| Directory listing, `File.readdir` | `FileFullDirectoryRestartInfo`, then `FileIdBothDirectoryRestartInfo`; the `FindFirstFile` reader removed | both classes first, then `NtQueryDirectoryFile` by handle, then `FindFirstFile` |
+| `RemoveAll` | the handle-relative `removeAllFrom` for both `os.RemoveAll` and `Root.RemoveAll` | the same walk, with the change under "os.Root.RemoveAll" |
+| Console names in `os.Stat` | retry `GetFileAttributesEx` misses and `CreateFile` refusals by name, and open `\\.\CONIN$` as `CONIN$` | the base's, which covers XP's refusals as well; `SupportDeviceNamesInFileAPIs` only gates a test |
+| Runtime DLL loading | `LoadLibraryExW` with `LOAD_LIBRARY_SEARCH_SYSTEM32`, then by absolute path in the system directory; `ProcessPrng`, then `RtlGenRandom` | the same; the Vista kernel32 entry points are looked up in the kernel32 that path loads |
+| File I/O, `internal/poll` | handles other than sockets stay off the completion port where it cannot release them, each operation waiting on an event | the same, and `Close` wakes those waits where `CancelIoEx` is missing, since `CancelIo` from `Close`'s thread cannot reach them |
+| `os.Remove` | deletes through `Deleteat` on the parent first | the base's |
+
+The rest of `v1.27.1-1` merges without touching an XP patch.
+
 ## Known unfixed
 
 - `CancelIoEx` has no XP equivalent, and this is the root of most of what
@@ -575,7 +565,10 @@ by `os.SameFile`, the latter's 200-character name included, and
   the operations it is able to, and `Close` gives up after five seconds rather
   than waiting forever on a completion that cannot arrive, leaking the handle
   and thread instead of hanging. Set `GOXP_ABANDONED_CLOSE=warn` (or `panic`)
-  to find out when that happens.
+  to find out when that happens. Handles other than sockets stay off the
+  completion port on XP, because it cannot take a handle back off one, and an
+  operation on them waits on its own event; `Close` signals those waits so that
+  each cancels its own operation from the thread it is pinned to.
 - `Cmd.WaitDelay` does not bound `Wait` when a grandchild inherits the child's
   output pipe. WaitDelay works by abandoning the pending read, which is the one
   thing XP cannot do, so `Wait` blocks until the grandchild exits on its own.

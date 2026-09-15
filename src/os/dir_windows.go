@@ -129,9 +129,18 @@ var readDirPreVista = false
 // Tests shrink it to make entries overflow it.
 var readDirNtQueryBufSize = dirBufSize
 
+// fileFullDirInfoUnsupported starts every directory on
+// FileIdBothDirectoryRestartInfo, as readdir does for one directory once the
+// kernel has rejected FileFullDirectoryRestartInfo. Useful for testing
+// purposes.
+var fileFullDirInfoUnsupported = false
+
 func (d *dirInfo) init(h syscall.Handle) {
 	d.h = h
 	d.class = windows.FileFullDirectoryRestartInfo
+	if fileFullDirInfoUnsupported {
+		d.class = windows.FileIdBothDirectoryRestartInfo
+	}
 	// The previous settings are enough to read the directory entries.
 	// The following code is only needed to support os.SameFile.
 
@@ -235,6 +244,14 @@ func (file *File) readdir(n int, mode readdirMode) (names []string, dirents []Di
 					d.buf = nil
 					break
 				}
+				if err == windows.ERROR_INVALID_PARAMETER && d.class == windows.FileFullDirectoryRestartInfo {
+					// This kernel does not know FILE_FULL_DIR_INFO, which
+					// every Windows before 8 lacks. Read this directory
+					// with the class it does know, which carries every
+					// field readdir uses.
+					d.class = windows.FileIdBothDirectoryRestartInfo
+					continue
+				}
 				if err == syscall.ERROR_FILE_NOT_FOUND &&
 					(d.class == windows.FileIdBothDirectoryRestartInfo || d.class == windows.FileFullDirectoryRestartInfo) {
 					// GetFileInformationByHandleEx doesn't document the return error codes when the info class is FileIdBothDirectoryRestartInfo,
@@ -249,15 +266,20 @@ func (file *File) readdir(n int, mode readdirMode) (names []string, dirents []Di
 					break
 				}
 				if (err == windows.ERROR_INVALID_PARAMETER || err == windows.ERROR_NOT_SUPPORTED) &&
-					(d.class == windows.FileFullDirectoryRestartInfo || d.class == windows.FileFullDirectoryInfo) {
+					(d.class == windows.FileFullDirectoryRestartInfo || d.class == windows.FileFullDirectoryInfo ||
+						d.class == windows.FileIdBothDirectoryRestartInfo) {
 					// GetFileInformationByHandleEx is Vista and later, and this
 					// fork's binding reports its absence as ERROR_NOT_SUPPORTED,
-					// so on Windows XP this is the first call's answer. Very old
-					// SMB shares refuse FileFullDirectoryRestartInfo too (common
-					// with Windows 7 accessing SMB 1.0 shares). Either way, read
-					// the directory with the native call instead, from the same
-					// handle.
+					// so on Windows XP this is the first call's answer. A file
+					// system can also refuse both directory classes this
+					// reader knows. Either way, read the directory with the
+					// native call instead, from the same handle.
 					d.reader = dirReaderNtQuery
+					if d.path == "" {
+						// The FILE_ID_BOTH_DIR_INFO route leaves the path
+						// unset, and os.SameFile needs it for these entries.
+						d.path, _ = windows.FinalPath(d.h, windows.FILE_NAME_OPENED)
+					}
 					return readDirNtQuery(file, d, n, wantAll, mode)
 				}
 				if s, _ := file.Stat(); s != nil && !s.IsDir() {
