@@ -3,7 +3,7 @@
 Go 1.27.1 that produces binaries Windows XP (NT 5.1) will load and run.
 
     Base:   thongtech/go-legacy-win7 v1.27.1-1 @ 2f6cdc24   (Go 1.27.1, targets Win7 / PE 6.1)
-    Delta:  58 files, +6373 / -212                (takes it back to XP / PE 5.1)
+    Delta:  58 files, +6567 / -217                (takes it back to XP / PE 5.1)
             + a root-certificate fallback         (see "HTTPS on XP" below)
             + os.Root made to work at all         (see "os.Root on XP" below)
             + directories listed by handle        (see "Directory listing on XP" below)
@@ -551,7 +551,7 @@ keeps one answer, and says which.
 | `RemoveAll` | the handle-relative `removeAllFrom` for both `os.RemoveAll` and `Root.RemoveAll` | the same walk, with the change under "os.Root.RemoveAll" |
 | Console names in `os.Stat` | retry `GetFileAttributesEx` misses and `CreateFile` refusals by name, and open `\\.\CONIN$` as `CONIN$` | the base's, which covers XP's refusals as well; `SupportDeviceNamesInFileAPIs` only gates a test |
 | Runtime DLL loading | `LoadLibraryExW` with `LOAD_LIBRARY_SEARCH_SYSTEM32`, then by absolute path in the system directory; `ProcessPrng`, then `RtlGenRandom` | the same; the Vista kernel32 entry points are looked up in the kernel32 that path loads |
-| File I/O, `internal/poll` | handles other than sockets stay off the completion port where it cannot release them, each operation waiting on an event | the same, and `Close` wakes those waits where `CancelIoEx` is missing, since `CancelIo` from `Close`'s thread cannot reach them |
+| File I/O, `internal/poll` | handles other than sockets stay off the completion port where it cannot release them, each operation waiting on an event | the same, and where `CancelIoEx` is missing every event-driven wait also waits on an event `Close` signals, since `CancelIo` from `Close`'s thread cannot reach the operation: files, a socket `FD.Init` leaves on a port it cannot move, and a socket `DisassociateIOCP` counts as off one |
 | `os.Remove` | deletes through `Deleteat` on the parent first | the base's |
 
 The rest of `v1.27.1-1` merges without touching an XP patch.
@@ -607,13 +607,55 @@ What each merge area rests on:
 - **Console names in `os.Stat`**: `TestStatConsole`, for `CON`, `CONIN$`,
   `CONOUT$` and `\\.\CON`; `TestConsoleNames` covers the name matching alone.
 
+#### Second round: completion ports, `internal/poll`, `net`
+
+Windows XP 5.1.2600 SP3, 2026-09-15, on the tree at `7241b70e`.
+
+Keeping files off the runtime's completion port made
+`TestFileAssociatedWithExternalIOCP` run on XP, where `canReassociateIOCP`
+had skipped it: a file's first association is now the caller's, and succeeds.
+The test ends a `GetQueuedCompletionStatus` waiting with `INFINITE` by
+closing the port, which returns `ERROR_ABANDONED_WAIT_0` only from Vista on;
+on XP the wait stays, and the test binary hung until its timeout, with no
+completion queued. Before Vista the test's wait is bounded, and running out
+with nothing queued is its pass. The file I/O the test checks posts nothing to
+the caller's port on XP either way.
+
+| Run | Tests | Pass | Fail | Skip |
+|---|---|---|---|---|
+| `os`: `TestFileAssociatedWithExternalIOCP`, `TestFileEventDrivenCloseUnblocks`, `TestCloseWithBlockingReadByFd`, `TestCloseWithBlockingReadByNewFile` | 4 | 4 | 0 | 0 |
+| `os`: `TestFileWriteFdRace`, `TestFileFdWithConcurrentIO`, `TestFileEventDrivenDeadlines`, `TestStdinOverlappedPipe`, `TestReadWriteFileOverlapped`, `TestFileOverlapped*` | 7 | 6 | 0 | 1 |
+| `internal/poll`, all | 19 | 15 | 3 | 1 |
+| `net`: `TestFileNoDisassociateIOCP`, `TestFileNoDisassociateIOCPClose`, `TestSysSocketNoHandleInheritFallback` | 3 | 3 | 0 | 0 |
+| `net`: `TestFileConn`, `TestFileListener`, `TestFilePacketConn`, `TestFileCloseRace`, `TestReadFromTimeout*` | 15 | 10 | 0 | 5 |
+| `net`, `-short` | 455 | 289 | 17 | 149 |
+
+The skip in the second row is `TestFileFdWithConcurrentIO`'s check of the
+runtime's port, which files do not use on XP; the concurrent I/O before it
+runs. The `net` skips in the fifth row are Unix-domain sockets. Six of the 17
+`net -short` failures are the `TestSendfile*` tests, which could not find
+`testdata/Isaac.Newton-Opticks.txt` in the copied working directory and pass
+with it.
+
+Every remaining failure was run again with the `internal/poll` and `net` test
+binaries of the tree before the 1.27.1 merge, on the same machine:
+
+| Tests | 1.27.1 | Before the merge |
+|---|---|---|
+| `internal/poll`: `TestWSASocketConflict`, `TestSocketSkipsCompletionPortOnSuccess`, `TestFileSkipsCompletionPortOnSuccess`, `TestDatagramSocketSkipsCompletionPortOnSuccess` | 1 pass, 3 fail | 3 fail; the fourth test does not exist there |
+| `net`: `TestInterfaceAddrs`, `TestInterfaceUnicastAddrs`, `TestInterfaceMulticastAddrs`, `TestInterfacesWithNetsh`, `TestInterfaceAddrsWithNetsh`, `TestInterfaceHardwareAddrWithGetmac` | 6 fail | 6 fail |
+| `net`: `TestUDPConnSpecificMethods`, `TestWriteToUDP`, `TestAllocs`, `TestIPv4WriteMsgUDPAddrPortTargetAddrIPVersion`, `TestReadWriteMsgUDPAddrPortEmptyCmsg` | 5 fail | 5 fail |
+| `net`: `TestSendfile*`, with the test data | 6 pass | 6 pass |
+
+The same failures on both trees, for the XP gaps listed under "Known unfixed".
+
 Not measured on hardware:
 
-- **`Close` waking event-driven waits.** No filter above ran
-  `TestFileEventDrivenCloseUnblocks`, the test for it.
-  `TestCloseWithBlockingReadByNewFile` passes, but it uses a synchronous
-  handle and passes through the five-second abandon described under "Known
-  unfixed", not through this path.
+- **`Close` on the two event-driven socket waits**: a socket `FD.Init` leaves
+  on a completion port it cannot move, and a socket `DisassociateIOCP` counts
+  as off one. That `Close` wakes them rests on reading the code; no test
+  reaches either wait. `TestFileEventDrivenCloseUnblocks` measures the same
+  mechanism for a file.
 - **Pending operations on overlapped pipes cancelled from another goroutine.**
   `canCancelPendingIO` skips 172 subtests of `TestVariousDeadlines*` and
   `TestReadWriteDeadlineRace`, and all of `TestPipeCanceled` and
@@ -634,8 +676,6 @@ Not measured on hardware:
   longer takes `syscall.ForkLock`. On XP `StartProcess` inherits every
   inheritable handle and takes no lock either, so a socket created while a
   child starts can leak into it. `TestExtraFilesRace` skips on every Windows.
-- **`internal/poll`'s own tests**, including its completion-port tests for
-  datagram sockets, and `net`.
 
 ## Known unfixed
 
@@ -650,6 +690,28 @@ Not measured on hardware:
   completion port on XP, because it cannot take a handle back off one, and an
   operation on them waits on its own event; `Close` signals those waits so that
   each cancels its own operation from the thread it is pinned to.
+- `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` is never set: its setter,
+  `SetFileCompletionNotificationModes`, is Vista. An operation that completes
+  at once is still waited on, for its completion packet or its event. It is
+  correct and costs one wait. `TestFileSkipsCompletionPortOnSuccess` and
+  `TestSocketSkipsCompletionPortOnSuccess` fail on XP for this reason.
+- `SIO_TCP_INFO` does not exist before Windows 10 1703, so
+  `TestWSASocketConflict`'s `WSAIoctl` is refused with `WSAEINVAL`.
+- Interface addresses report a prefix length of 0. `net` reads it from
+  `IP_ADAPTER_UNICAST_ADDRESS.OnLinkPrefixLength`, which is Vista; XP's
+  `GetAdaptersAddresses` does report prefixes, in each adapter's prefix list,
+  from which the length could be taken. `TestInterfaceAddrs`,
+  `TestInterfaceUnicastAddrs` and `TestInterfaceMulticastAddrs` fail on XP for
+  this reason.
+- `UDPConn.WriteMsgUDP` and `WriteMsgUDPAddrPort` fail with `WSAEINVAL`, with
+  or without control data, because they go through `WSASendMsg`, which is
+  Vista. `WriteTo`, `WriteToUDP` and `Write` go through `WSASendTo` and work. A
+  `WriteMsg` call with no control data could go through `WSASendTo` as well. `TestUDPConnSpecificMethods`, `TestWriteToUDP`, `TestAllocs`,
+  `TestIPv4WriteMsgUDPAddrPortTargetAddrIPVersion` and
+  `TestReadWriteMsgUDPAddrPortEmptyCmsg` fail on XP for this reason.
+- `TestInterfacesWithNetsh`, `TestInterfaceAddrsWithNetsh` and
+  `TestInterfaceHardwareAddrWithGetmac` run `netsh` and `getmac` through
+  PowerShell, which XP does not have, and fail there.
 - `Cmd.WaitDelay` does not bound `Wait` when a grandchild inherits the child's
   output pipe. WaitDelay works by abandoning the pending read, which is the one
   thing XP cannot do, so `Wait` blocks until the grandchild exits on its own.
