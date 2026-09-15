@@ -2116,10 +2116,15 @@ func iocpAssociateFile(f *os.File, iocp syscall.Handle) error {
 	return err
 }
 
-// canReassociateIOCP reports whether a file handle that is already
-// associated with one I/O completion port (as every overlapped os.File is,
-// with the runtime's own internal IOCP, from the moment it's opened) can be
-// associated with a second, different IOCP the way iocpAssociateFile does.
+// canReassociateIOCP reports whether an overlapped os.File can be associated
+// with an I/O completion port of the caller's the way iocpAssociateFile does.
+//
+// Where the kernel can take a handle back off a port, an overlapped os.File is
+// associated with the runtime's own port from the moment it is opened, and Fd
+// takes it off again. Where it cannot, which is before Windows 8.1,
+// internal/poll never puts a file on the runtime's port (see canDetachFromIOCP
+// there), so the caller's association is the first and succeeds, and this
+// reports true on XP as well.
 //
 // Windows 8 added FileReplaceCompletionInformation for this; before that,
 // CreateIoCompletionPort's documented behavior for a handle that already has
@@ -2151,6 +2156,14 @@ var canReassociateIOCP = sync.OnceValue(func() bool {
 	return iocpAssociateFile(f, iocp) == nil
 })
 
+// closeEndsIOCPWait reports whether closing an I/O completion port ends a
+// GetQueuedCompletionStatus already waiting on it, with
+// ERROR_ABANDONED_WAIT_0. That arrived with Windows Vista.
+func closeEndsIOCPWait() bool {
+	major, _, _ := windows.Version()
+	return major >= 6
+}
+
 func TestFileAssociatedWithExternalIOCP(t *testing.T) {
 	if !canReassociateIOCP() {
 		t.Skip("cannot associate a handle with a second I/O completion port on this platform (see canReassociateIOCP)")
@@ -2181,11 +2194,22 @@ func TestFileAssociatedWithExternalIOCP(t *testing.T) {
 		}
 	}()
 
+	// The goroutine below is ended by closing the port, which makes a waiting
+	// GetQueuedCompletionStatus return ERROR_ABANDONED_WAIT_0 from Windows
+	// Vista on. Before Vista closing the port does not end the wait at all:
+	// measured on XP SP3, the goroutine stayed parked in an INFINITE wait
+	// with the port closed and no completion queued, until the test binary's
+	// timeout. There the wait is bounded instead, and running out without a
+	// completion is the same answer: nothing was posted to the port.
+	waitMillis := uint32(syscall.INFINITE)
+	if !closeEndsIOCPWait() {
+		waitMillis = 2000
+	}
 	ch := make(chan error, 1)
 	go func() {
 		var bytes, key uint32
 		var overlapped *syscall.Overlapped
-		err := syscall.GetQueuedCompletionStatus(syscall.Handle(iocp), &bytes, &key, &overlapped, syscall.INFINITE)
+		err := syscall.GetQueuedCompletionStatus(syscall.Handle(iocp), &bytes, &key, &overlapped, waitMillis)
 		ch <- err
 	}()
 
@@ -2218,10 +2242,12 @@ func TestFileAssociatedWithExternalIOCP(t *testing.T) {
 	err = <-ch
 	iocp = syscall.InvalidHandle
 	const ERROR_ABANDONED_WAIT_0 = syscall.Errno(735)
-	switch err {
-	case ERROR_ABANDONED_WAIT_0:
+	switch {
+	case err == ERROR_ABANDONED_WAIT_0:
 		// This is what we expect.
-	case nil:
+	case err == syscall.Errno(syscall.WAIT_TIMEOUT) && !closeEndsIOCPWait():
+		// The bounded wait above ran out with no completion queued.
+	case err == nil:
 		t.Error("unexpected queued completion")
 	default:
 		t.Error(err)

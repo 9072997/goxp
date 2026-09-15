@@ -552,7 +552,7 @@ func (fd *FD) Init(net string, pollable bool) error {
 			// The handle came from a socket that is already on a completion
 			// port, and this kernel cannot move it. Leave it where it is and
 			// drive it with an event. See canDetachFromIOCP.
-			return nil
+			return fd.initCloseWakeEvents()
 		}
 		fd.associated = true
 	}
@@ -588,6 +588,20 @@ func (fd *FD) initDeadlineEvents() error {
 	}
 	fd.readDeadlineEvent, fd.writeDeadlineEvent = r, w
 	return nil
+}
+
+// initCloseWakeEvents gives fd the events waitEventIO waits on alongside an
+// operation, if it does not have them yet, where CancelIoEx is missing. An
+// event-driven operation on a handle without them waits for the operation
+// alone, and there only CancelIoEx from Close can end that wait, since CancelIo
+// reaches just the calling thread's I/O. With them, Close signals the wait and
+// the waiting thread cancels its own operation. The caller must have exclusive
+// use of fd.
+func (fd *FD) initCloseWakeEvents() error {
+	if fd.readDeadlineEvent != 0 || windows.SupportCancelIoEx() {
+		return nil
+	}
+	return fd.initDeadlineEvents()
 }
 
 // keepsOwnDeadlines reports whether fd holds its own deadlines, which it does
@@ -779,6 +793,9 @@ func (fd *FD) DisassociateIOCP() error {
 	if !canDetachFromIOCP() {
 		// The handle cannot come off the port. Count it as off all the
 		// same, so that I/O on it is driven with an event from here on.
+		if err := fd.initCloseWakeEvents(); err != nil {
+			return err
+		}
 		fd.associated = false
 		return nil
 	}
@@ -888,13 +905,16 @@ func (fd *FD) Close() error {
 		// closed, and the handle cannot close until the operation holding
 		// it lets go.
 		syscall.CancelIoEx(fd.Sysfd, nil)
-		if fd.keepsOwnDeadlines() && !windows.SupportCancelIoEx() {
-			// Where CancelIoEx is missing, the call above is CancelIo, which
-			// reaches only this thread's I/O. Wake the waiters instead, so
-			// that each cancels its own operation. See waitEventIO.
-			windows.SetEvent(fd.readDeadlineEvent)
-			windows.SetEvent(fd.writeDeadlineEvent)
-		}
+	}
+	if fd.readDeadlineEvent != 0 && !windows.SupportCancelIoEx() {
+		// Where CancelIoEx is missing, the call above is CancelIo, which
+		// reaches only this thread's I/O. Wake the event-driven waiters
+		// instead, so that each cancels its own operation. See waitEventIO
+		// and initCloseWakeEvents. This includes a socket that
+		// DisassociateIOCP counted as off a port it cannot leave, which
+		// the condition above does not.
+		windows.SetEvent(fd.readDeadlineEvent)
+		windows.SetEvent(fd.writeDeadlineEvent)
 	}
 	// unblock pending reader and writer
 	fd.pd.evict()
