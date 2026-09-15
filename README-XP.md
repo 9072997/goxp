@@ -3,7 +3,7 @@
 Go 1.27.0 that produces binaries Windows XP (NT 5.1) will load and run.
 
     Base:   thongtech/go-legacy-win7 @ 1b73f848   (Go 1.27.0, targets Win7 / PE 6.1)
-    Delta:  63 files, +6548 / -233                (takes it back to XP / PE 5.1)
+    Delta:  63 files, +6640 / -234                (takes it back to XP / PE 5.1)
             + a root-certificate fallback         (see "HTTPS on XP" below)
             + os.Root.RemoveAll restored          (see "os.Root.RemoveAll" below)
             + os.Root made to work at all         (see "os.Root on XP" below)
@@ -504,10 +504,19 @@ The directory handles `os` opens already allow the query. `os.Open` goes through
 `FILE_SYNCHRONOUS_IO_NONALERT`. Both grant `FILE_LIST_DIRECTORY` and synchronous
 I/O.
 
+`os.SameFile` compares identities it reads by opening each `FileInfo`'s path
+again. For a listing entry that path is the directory's joined with the name;
+for a `Stat` or `Lstat` result it is the path `stat` opened. Both reopens go
+through `fixLongPath`, as the original opens did, so a long path gets its
+`\\?\` prefix. A process that is not long-path aware, which on XP is every
+process, cannot open a path of 248 characters or more without it. Upstream's
+`fileStat.loadFileId` reopens a `Stat` or `Lstat` path without the prefix,
+and there `os.SameFile` reports false for such a path.
+
 | File | Change |
 |---|---|
 | `src/os/dir_windows.go` | `readDirNtQuery`; the `FindFirstFile` reader as the last resort |
-| `src/os/types_windows.go` | `newFileStatFromFileBothDirInformation` |
+| `src/os/types_windows.go` | `newFileStatFromFileBothDirInformation`; `loadFileId` reopens a `Stat` or `Lstat` path through `fixLongPath` |
 | `src/internal/syscall/windows/syscall_windows.go` | `NtQueryDirectoryFile`, `FILE_BOTH_DIR_INFORMATION`, six status codes |
 | `src/internal/syscall/windows/zsyscall_windows.go` | the `NtQueryDirectoryFile` binding, with a `.Find()` guard |
 | `src/internal/syscall/windows/at_windows.go` | `ReopenDirectoryForListing` |
@@ -522,14 +531,19 @@ host tests the XP path too.
 
 - `TestRootReadDirAfterJunctionSwap`: the swap above, through `Open` listed four
   ways and through a sub-root's `Open(".")` and `FS`.
-- `TestReadDirByHandleFields`: every field of every entry against `Lstat`,
-  including a junction, a read-only file, a non-ASCII name and a 200-character
-  name.
+- `TestReadDirByHandleFields`: every field of every entry, and `os.SameFile`,
+  against `Lstat`, including a junction, a read-only file, a non-ASCII name and
+  a 200-character name.
 - `TestReadDirByHandlePaging`: pages of 1, 3, 5 and 100, past the end, after a
   `Seek`, and with a 128-byte buffer so that entries overflow it mid-listing.
 - `TestReadDirByHandleOverlapped` and `TestReadDirByHandleOddCases`: an
   overlapped handle, an empty directory, a regular file (`ENOTDIR`), and the
   named-pipe file system.
+- `TestSameFileLongPath`: `os.SameFile` between `Lstat`, `Stat` and a listing
+  entry of a file whose path is 248 characters or more, in a process that is
+  not long-path aware. On a Windows that makes the process long-path aware, the
+  test clears the PEB bit that does so for its duration, and first checks that
+  the path without the prefix really fails to open.
 
 ### Verified on hardware
 
@@ -544,14 +558,13 @@ swapped sub-root, pass. A directory reached by a 365-character path, past
 
 The `os` test binary, run from a copy of `src/os` with
 
-    os.test.exe -test.v -test.run "^(TestRootReadDirAfterJunctionSwap|TestReadDirByHandle.*|TestRootJunctionContainment|TestReadDir.*|TestReaddir.*|TestFileReadDir|TestFileReaddir.*|TestDirFS.*|TestRootDirFS|TestRootRemoveAll.*|TestRemoveAll.*|TestRootOpen_Directory|TestSameFile)$"
+    os.test.exe -test.v -test.run "^(TestRootReadDirAfterJunctionSwap|TestReadDirByHandle.*|TestRootJunctionContainment|TestReadDir.*|TestReaddir.*|TestFileReadDir|TestFileReaddir.*|TestDirFS.*|TestRootDirFS|TestRootRemoveAll.*|TestRemoveAll.*|TestRootOpen_Directory|TestSameFile.*)$"
 
 passes every test it runs. The 42 skips are symlink fixtures XP cannot build and
-tests that do not apply to Windows. `TestFileReadDir`, which compares each
-entry of a listing with `Lstat` by `os.SameFile`, passes.
-`TestReadDirByHandleFields` does not compare its 200-character name that way,
-for the reason given under "Known unfixed"; it compares that entry's identity
-with the same entry from a second listing instead.
+tests that do not apply to Windows. That includes `TestFileReadDir` and
+`TestReadDirByHandleFields`, which compare each entry of a listing with `Lstat`
+by `os.SameFile`, the latter's 200-character name included, and
+`TestSameFileLongPath`.
 
 ## Known unfixed
 
@@ -571,13 +584,6 @@ with the same entry from a second listing instead.
   then waits at an error dialog. So starting a corrupt `.exe` returns no error
   and the resulting process never exits, where 64-bit Windows fails cleanly
   with `ERROR_BAD_EXE_FORMAT`.
-- `os.SameFile` reports false when either argument came from `os.Stat` or
-  `os.Lstat` of a path of 248 characters or more, in a process that is not
-  long-path aware, which on XP is every process. `stat` saves the path as
-  given, and `fileStat.loadFileId` opens it without `fixLongPath` to read the
-  file's identity, so the open fails. Upstream Go has the same code. A
-  `FileInfo` from a directory listing is not affected: its path is joined and
-  extended before the open.
 - Symbolic links cannot be created with `os.Symlink` or followed by anything but
   `os.Root`, and deleting or renaming over a file that is still open is deferred
   rather than immediate. Both are detailed under "os.Root on XP".

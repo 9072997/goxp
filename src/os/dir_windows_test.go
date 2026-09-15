@@ -16,6 +16,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"unsafe"
 )
 
 // forEachReadDirReader runs f once with File.readdir as it is on this machine,
@@ -234,18 +235,8 @@ func testReadDirByHandleFields(t *testing.T) {
 		if fi2, err := again[i].Info(); err != nil || again[i].Name() != e.Name() || !os.SameFile(fi, fi2) {
 			t.Errorf("%s: os.SameFile of the entry from two listings = false (second: %q, %v)", e.Name(), again[i].Name(), err)
 		}
-		// Comparing with Lstat also needs Lstat's result to be looked up, and
-		// os.SameFile cannot do that for a path fixLongPath would have to
-		// extend, where the process is not long-path aware (Windows XP, or a
-		// later Windows without long paths enabled): stat saves the path as
-		// given, and fileStat.loadFileId passes it to CreateFile without
-		// fixLongPath, so the open fails and os.SameFile reports false. That
-		// is independent of how the directory was listed, so it is not
-		// asserted there.
-		if windows.CanUseLongPaths || len(path) < 248 {
-			if !os.SameFile(fi, lst) {
-				t.Errorf("%s: os.SameFile(DirEntry.Info(), Lstat) = false", e.Name())
-			}
+		if !os.SameFile(fi, lst) {
+			t.Errorf("%s: os.SameFile(DirEntry.Info(), Lstat) = false", e.Name())
 		}
 	}
 	if !slices.Equal(names, wantNames) {
@@ -395,6 +386,96 @@ func TestReadDirByHandleOddCases(t *testing.T) {
 			if _, err := os.ReadDir(pipes); err != nil {
 				t.Errorf("ReadDir(%q) = %v", pipes, err)
 			}
+		}
+	})
+}
+
+// withoutLongPaths runs the rest of the test as a process that is not
+// long-path aware, which is what every process on Windows XP is: the Win32
+// file API refuses a long path unless it carries the \\?\ prefix, which
+// fixLongPath adds. On Windows 10 1703 and later the
+// runtime makes the process long-path aware at startup by setting a bit in the
+// PEB; this clears the bit again until the test ends. Where the runtime did not
+// set it, there is nothing to undo.
+//
+// The test must not be parallel: the bit and CanUseLongPaths are process-wide.
+func withoutLongPaths(t *testing.T) {
+	if !windows.CanUseLongPaths {
+		return
+	}
+	proc := syscall.NewLazyDLL("ntdll.dll").NewProc("RtlGetCurrentPeb")
+	if proc.Find() != nil {
+		t.Skip("no RtlGetCurrentPeb, so long paths cannot be switched off")
+	}
+	const (
+		isLongPathAwareProcess = 0x80
+		pebBitFieldOffset      = 3
+	)
+	peb, _, _ := proc.Call()
+	bitField := (*byte)(unsafe.Add(unsafe.Pointer(peb), pebBitFieldOffset))
+	*bitField &^= isLongPathAwareProcess
+	windows.CanUseLongPaths = false
+	t.Cleanup(func() {
+		*bitField |= isLongPathAwareProcess
+		windows.CanUseLongPaths = true
+	})
+}
+
+// TestSameFileLongPath checks os.SameFile on FileInfos for a file whose
+// absolute path is too long for the Win32 file API without the \\?\ prefix,
+// in a process that is not long-path aware. os.SameFile reads a Stat or Lstat
+// result's identity by opening the path again, and that open has to go
+// through fixLongPath just as the original one did.
+func TestSameFileLongPath(t *testing.T) {
+	withoutLongPaths(t)
+	forEachReadDirReader(t, func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), strings.Repeat("d", 100))
+		path := filepath.Join(dir, strings.Repeat("f", 150))
+		if len(path) < 248 {
+			t.Fatalf("path is %d characters, not long enough to need the prefix", len(path))
+		}
+		if err := os.MkdirAll(dir, 0o777); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("long"), 0o666); err != nil {
+			t.Fatal(err)
+		}
+
+		// The control: without the prefix this path really cannot be opened,
+		// or nothing below tests fixLongPath at all.
+		if p, err := syscall.UTF16PtrFromString(path); err != nil {
+			t.Fatal(err)
+		} else if _, err := syscall.GetFileAttributes(p); err == nil {
+			t.Fatalf("GetFileAttributes of the %d-character path without the prefix succeeded, so long paths are not switched off", len(path))
+		}
+
+		lstat, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stat, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 1 {
+			t.Fatalf("ReadDir = %v, want one entry", entries)
+		}
+		entry, err := entries[0].Info()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !os.SameFile(lstat, stat) {
+			t.Errorf("os.SameFile(Lstat, Stat) = false")
+		}
+		if !os.SameFile(lstat, entry) {
+			t.Errorf("os.SameFile(Lstat, ReadDir entry) = false")
+		}
+		if !os.SameFile(stat, entry) {
+			t.Errorf("os.SameFile(Stat, ReadDir entry) = false")
 		}
 	})
 }

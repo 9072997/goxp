@@ -334,7 +334,11 @@ func (fs *fileStat) loadFileId() error {
 	if fs.appendNameToPath {
 		path = fixLongPath(fs.path + `\` + fs.name)
 	} else {
-		path = fs.path
+		// fs.path is the path stat opened, through fixLongPath. The reopen
+		// needs the same transform: without the \\?\ prefix it adds, a long
+		// path fails to open wherever long paths are not enabled, which on
+		// Windows XP is everywhere.
+		path = fixLongPath(fs.path)
 	}
 	pathp, err := syscall.UTF16PtrFromString(path)
 	if err != nil {
