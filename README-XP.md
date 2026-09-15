@@ -10,8 +10,8 @@ Go 1.27.1 that produces binaries Windows XP (NT 5.1) will load and run.
 
 The base is merged, not rebased: `go1.27.1-xp` is the XP line with
 `v1.27.1-1` merged into it, and "Merging the base" below says what that merge
-had to reconcile. The hardware measurements recorded in this file were taken
-on XP builds from before that merge.
+had to reconcile. "Verified on hardware after the merge", at the end of that
+section, is what this tree has been measured doing on XP, and what it has not.
 
 Upstream Go dropped Windows XP after 1.10. `go-legacy-win7` restores Windows 7;
 this restores XP on top of it, which is a further set of problems because Go has
@@ -555,6 +555,87 @@ keeps one answer, and says which.
 | `os.Remove` | deletes through `Deleteat` on the parent first | the base's |
 
 The rest of `v1.27.1-1` merges without touching an XP patch.
+
+### Verified on hardware after the merge
+
+Windows XP 5.1.2600 SP3, 2026-09-15: this tree, cross-compiled `windows/386`
+with its own toolchain, every binary run from `cmd.exe` to its final `PASS`.
+Counts include subtests.
+
+| Binary and filter | Run | Pass | Fail | Skip |
+|---|---|---|---|---|
+| `osroot-probe` | 91 | 91 | 0 | — |
+| `os`, listing, `RemoveAll`, `SameFile` | 131 | 89 | 0 | 42 |
+| `os`, `Openat`, delete, rename, stat, console | 542 | 317 | 0 | 225 |
+| `os`, pipes, deadlines, overlapped I/O | 206 | 28 | 0 | 178 |
+| `os/exec`, `-short` | 110 | 100 | 0 | 10 |
+| `crypto/x509`, `-short` | 598 | 576 | 0 | 22 |
+
+The `os` filters, run from a copy of `src/os`:
+
+    listing:  ^(TestRootReadDirAfterJunctionSwap|TestReadDirByHandle.*|TestRootJunctionContainment|TestReadDir.*|TestReaddir.*|TestFileReadDir|TestFileReaddir.*|TestDirFS.*|TestRootDirFS|TestRootRemoveAll.*|TestRemoveAll.*|TestRootOpen_Directory|TestSameFile.*)$
+    delete:   ^(TestOpenat.*|TestRenameat.*|TestRemove.*|TestRename.*|TestRootRemove.*|TestRootRename.*|TestRootChmod|TestChmod|TestStat.*|TestConsoleNames|TestRootConsistency.*)$
+    pipes:    ^(TestPipe.*|TestNamedPipe|TestNewFile.*|TestFileEventDrivenDeadlines|TestFileOverlapped.*|TestReadWriteFileOverlapped|TestNonpollableDeadline|TestVariousDeadlines.*|TestReadWriteDeadlineRace|TestCloseWithBlockingReadByNewFile|TestStdinOverlappedPipe|TestClosedPipeRace.*|TestEPIPE|TestStdPipe)$
+
+What each merge area rests on:
+
+- **Runtime startup**: system DLLs loaded by absolute path, the Vista kernel32
+  entry points looked up in that kernel32, `RtlGenRandom` in place of
+  `ProcessPrng`. Every binary above starts, and `osroot-probe` reports
+  `windows/386 go1.27.1`.
+- **`RtlGetNtVersionNumbers`**, now called unguarded by `StartProcess` and
+  `syscall.GetVersion`: `os/exec` starts child processes throughout its 100
+  passes.
+- **`Openat` on a kernel without `OBJ_DONT_REPARSE`**:
+  `TestOpenatNoObjDontReparse` and `TestRootJunctionContainment`, and the
+  probe's junction cases.
+- **Directory listing and `RemoveAll`**: the listing filter, `osroot-probe`'s
+  swap cases `R01` and `R04`, and `TestRemoveAllFallbackOpenFile`.
+- **Delete fallback**: `TestRemoveFallbackOpenFile`, for both `Root.Remove`
+  and `os.Remove`, removes a file another handle holds open with deletion
+  shared, finds its name free at once, and finds the moved copy in the
+  temporary directory; `TestRemoveFallbackReadOnlySwapped`,
+  `TestRemoveReadOnlyFile` and `TestRemoveReadOnlyDir` cover clearing the
+  read-only bit.
+- **Rename over a held target**: `TestRenameatReplaceLeavesNoStray`,
+  `TestRenameatRetryFailsRestoresTarget`, `TestRenameatDirOntoHeldFileKeepsFile`
+  and `TestRenameatReadOnlyTargetKept`.
+- **Event-driven file I/O in `internal/poll`**: `TestFileEventDrivenDeadlines`,
+  `TestReadWriteFileOverlapped`, `TestFileOverlappedSeek`,
+  `TestFileOverlappedReadAtSeekVolume`, `TestNonpollableDeadline`,
+  `TestStdinOverlappedPipe`, and the overlapped cases of `TestNamedPipe`.
+- **Console names in `os.Stat`**: `TestStatConsole`, for `CON`, `CONIN$`,
+  `CONOUT$` and `\\.\CON`; `TestConsoleNames` covers the name matching alone.
+
+Not measured on hardware:
+
+- **`Close` waking event-driven waits.** No filter above ran
+  `TestFileEventDrivenCloseUnblocks`, the test for it.
+  `TestCloseWithBlockingReadByNewFile` passes, but it uses a synchronous
+  handle and passes through the five-second abandon described under "Known
+  unfixed", not through this path.
+- **Pending operations on overlapped pipes cancelled from another goroutine.**
+  `canCancelPendingIO` skips 172 subtests of `TestVariousDeadlines*` and
+  `TestReadWriteDeadlineRace`, and all of `TestPipeCanceled` and
+  `TestClosedPipeRace*`, wherever `CancelIoEx` is missing. The skip predates
+  the event-driven path, which cancels from the waiting thread and so may
+  reach those operations now.
+- **`os.Stat` of `\\.\CONIN$` and `\\.\CONOUT$`.** `TestStatConsole` leaves
+  them out, without reporting a skip, wherever `SupportDeviceNamesInFileAPIs`
+  is false, so the base's retry of the bare name is not exercised.
+- **Rename onto a directory link.** `TestRenameatNoPosixSemantics` and
+  `TestRenameatDirOntoLinkKeepsLink` build their junction with `mklink /J`,
+  which XP does not have, and skip.
+- **Deleting a file held by a handle that does not share deletion**, such as
+  one from `os.Open`. The delete tests above hold the file through `Root.Open`,
+  which shares deletion; the deferred-delete table under "os.Root on XP" is
+  the measurement of the other case.
+- **Handle inheritance across `StartProcess`.** `net`'s socket fallback no
+  longer takes `syscall.ForkLock`. On XP `StartProcess` inherits every
+  inheritable handle and takes no lock either, so a socket created while a
+  child starts can leak into it. `TestExtraFilesRace` skips on every Windows.
+- **`internal/poll`'s own tests**, including its completion-port tests for
+  datagram sockets, and `net`.
 
 ## Known unfixed
 
