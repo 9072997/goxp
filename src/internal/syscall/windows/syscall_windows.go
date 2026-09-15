@@ -462,6 +462,36 @@ type FILE_FULL_DIR_INFO struct {
 	FileName        [1]uint16
 }
 
+// FILE_BOTH_DIR_INFORMATION is what NtQueryDirectoryFile returns for
+// FileBothDirectoryInformation. It is FILE_FULL_DIR_INFO with the 8.3 name
+// inserted before FileName, and it is the class kernel32's FindFirstFileW and
+// FindNextFileW are built on, on every NT including XP.
+//
+// ShortNameLength is a single byte (CCHAR), so ShortName starts at offset 70
+// and FileName at 94. Declaring ShortNameLength as uint32, as
+// FILE_ID_BOTH_DIR_INFO does, would put FileName two bytes too late.
+type FILE_BOTH_DIR_INFORMATION struct {
+	NextEntryOffset uint32
+	FileIndex       uint32
+	CreationTime    syscall.Filetime
+	LastAccessTime  syscall.Filetime
+	LastWriteTime   syscall.Filetime
+	ChangeTime      syscall.Filetime
+	EndOfFile       uint64
+	AllocationSize  uint64
+	FileAttributes  uint32
+	FileNameLength  uint32
+	EaSize          uint32
+	ShortNameLength uint8
+	ShortName       [12]uint16
+	FileName        [1]uint16
+}
+
+// Native information classes for NtQueryDirectoryFile.
+const (
+	FileBothDirectoryInformation = 3
+)
+
 //sys	GetVolumeInformationByHandle(file syscall.Handle, volumeNameBuffer *uint16, volumeNameSize uint32, volumeNameSerialNumber *uint32, maximumComponentLength *uint32, fileSystemFlags *uint32, fileSystemNameBuffer *uint16, fileSystemNameSize uint32) (err error) = GetVolumeInformationByHandleW
 //sys	GetVolumeNameForVolumeMountPoint(volumeMountPoint *uint16, volumeName *uint16, bufferlength uint32) (err error) = GetVolumeNameForVolumeMountPointW
 
@@ -573,6 +603,12 @@ const (
 	STATUS_INVALID_PARAMETER         NTStatus = 0xC000000D
 	STATUS_INVALID_INFO_CLASS        NTStatus = 0xC0000003
 	STATUS_ACCESS_DENIED             NTStatus = 0xC0000022
+	STATUS_PENDING                   NTStatus = 0x00000103
+	STATUS_BUFFER_OVERFLOW           NTStatus = 0x80000005
+	STATUS_NO_MORE_FILES             NTStatus = 0x80000006
+	STATUS_NOT_IMPLEMENTED           NTStatus = 0xC0000002
+	STATUS_INFO_LENGTH_MISMATCH      NTStatus = 0xC0000004
+	STATUS_NO_SUCH_FILE              NTStatus = 0xC000000F
 )
 
 const (
@@ -593,6 +629,7 @@ type FILE_MODE_INFORMATION struct {
 //sys   NtSetInformationFile(handle syscall.Handle, iosb *IO_STATUS_BLOCK, inBuffer unsafe.Pointer, inBufferLen uint32, class uint32) (ntstatus error) = ntdll.NtSetInformationFile
 //sys	RtlIsDosDeviceName_U(name *uint16) (ret uint32) = ntdll.RtlIsDosDeviceName_U
 //sys   NtQueryInformationFile(handle syscall.Handle, iosb *IO_STATUS_BLOCK, inBuffer unsafe.Pointer, inBufferLen uint32, class uint32) (ntstatus error) = ntdll.NtQueryInformationFile
+//sys   NtQueryDirectoryFile(handle syscall.Handle, event syscall.Handle, apcRoutine uintptr, apcContext uintptr, iosb *IO_STATUS_BLOCK, fileInformation unsafe.Pointer, length uint32, class uint32, returnSingleEntry bool, fileName *NTUnicodeString, restartScan bool) (ntstatus error) = ntdll.NtQueryDirectoryFile
 
 //sys	SetEntriesInAcl(countExplicitEntries uint32, explicitEntries *EXPLICIT_ACCESS, oldACL *ACL, newACL **ACL) (ret error) =  advapi32.SetEntriesInAclW
 //sys	SetNamedSecurityInfo(objectName string, objectType uint32, securityInformation uint32, owner *syscall.SID, group *syscall.SID, dacl *ACL, sacl *ACL) (ret error) = advapi32.SetNamedSecurityInfoW

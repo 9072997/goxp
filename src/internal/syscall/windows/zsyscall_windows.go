@@ -101,6 +101,7 @@ var (
 	procNetUserGetLocalGroups             = modnetapi32.NewProc("NetUserGetLocalGroups")
 	procNtCreateFile                      = modntdll.NewProc("NtCreateFile")
 	procNtOpenFile                        = modntdll.NewProc("NtOpenFile")
+	procNtQueryDirectoryFile              = modntdll.NewProc("NtQueryDirectoryFile")
 	procNtQueryInformationFile            = modntdll.NewProc("NtQueryInformationFile")
 	procNtSetInformationFile              = modntdll.NewProc("NtSetInformationFile")
 	procRtlGetVersion                     = modntdll.NewProc("RtlGetVersion")
@@ -600,6 +601,28 @@ func NtCreateFile(handle *syscall.Handle, access uint32, oa *OBJECT_ATTRIBUTES, 
 
 func NtOpenFile(handle *syscall.Handle, access uint32, oa *OBJECT_ATTRIBUTES, iosb *IO_STATUS_BLOCK, share uint32, options uint32) (ntstatus error) {
 	r0, _, _ := syscall.SyscallN(procNtOpenFile.Addr(), uintptr(unsafe.Pointer(handle)), uintptr(access), uintptr(unsafe.Pointer(oa)), uintptr(unsafe.Pointer(iosb)), uintptr(share), uintptr(options))
+	if r0 != 0 {
+		ntstatus = NTStatus(r0)
+	}
+	return
+}
+
+func NtQueryDirectoryFile(handle syscall.Handle, event syscall.Handle, apcRoutine uintptr, apcContext uintptr, iosb *IO_STATUS_BLOCK, fileInformation unsafe.Pointer, length uint32, class uint32, returnSingleEntry bool, fileName *NTUnicodeString, restartScan bool) (ntstatus error) {
+	// Present in every NT, XP included, but LazyProc.Addr panics on a missing
+	// entry point, so an ntdll without it reports an unsupported call instead
+	// of taking the process down.
+	if procNtQueryDirectoryFile.Find() != nil {
+		return STATUS_NOT_IMPLEMENTED
+	}
+	var _p0 uint32
+	if returnSingleEntry {
+		_p0 = 1
+	}
+	var _p1 uint32
+	if restartScan {
+		_p1 = 1
+	}
+	r0, _, _ := syscall.SyscallN(procNtQueryDirectoryFile.Addr(), uintptr(handle), uintptr(event), uintptr(apcRoutine), uintptr(apcContext), uintptr(unsafe.Pointer(iosb)), uintptr(fileInformation), uintptr(length), uintptr(class), uintptr(_p0), uintptr(unsafe.Pointer(fileName)), uintptr(_p1))
 	if r0 != 0 {
 		ntstatus = NTStatus(r0)
 	}

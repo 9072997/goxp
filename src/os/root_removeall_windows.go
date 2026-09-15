@@ -61,10 +61,11 @@ func rootRemoveAll(r *Root, name string) error {
 // during the walk is deleted as a link rather than followed.
 //
 // path is the path of base as seen from the process's current directory.
-// It is used for error messages, and to name the directory for the
-// FindFirstFile fallback in File.readdir, which is what Windows versions
-// without GetFileInformationByHandleEx (that is, Windows XP) list with.
-// It is never used to open, delete, or otherwise resolve anything.
+// It is used for error messages and as the name of the *File wrapping each
+// directory handle. It is never used to open, delete, or otherwise resolve
+// anything. File.readdir lists by handle, XP included; only its last resort,
+// for a file system that will not list a directory by handle at all, lists by
+// that name.
 func rootRemoveAllFrom(parentFd sysfdType, base, path string) error {
 	// Simple case: if the file can be removed, we're done.
 	err := removefileat(parentFd, base)
@@ -121,13 +122,13 @@ Walk:
 				if IsNotExist(readErr) {
 					// Upstream's fd-based walk returns success here: if the
 					// descriptor it is reading says the directory is gone, it
-					// is gone. This listing is not fd-based. On the Windows
-					// versions without GetFileInformationByHandleEx,
-					// File.readdir falls back to FindFirstFile, which resolves
-					// the directory by name, and a name that no longer resolves
-					// gives ERROR_PATH_NOT_FOUND — which IsNotExist accepts.
-					// So this error does not establish that the directory is
-					// gone, only that we cannot list it.
+					// is gone. This listing is not always handle-based.
+					// File.readdir's last resort, for a file system that will
+					// not list a directory by handle, resolves the directory by
+					// name, and a name that no longer resolves gives
+					// ERROR_PATH_NOT_FOUND — which IsNotExist accepts. So this
+					// error does not establish that the directory is gone, only
+					// that we cannot list it.
 					//
 					// Stop listing and let removedirat below answer the
 					// question: it succeeds if the directory really has gone,
@@ -189,8 +190,8 @@ Walk:
 // dirfd, and wraps it in a *File named path.
 //
 // The open is handle-relative and refuses to follow a reparse point in name;
-// path names the result only for the benefit of File.readdir's FindFirstFile
-// fallback and of error messages.
+// path names the result only for the benefit of error messages and of
+// File.readdir's last-resort reader, which lists by name.
 //
 // This acts like openFileNolog rather than OpenFile because
 // we are going to (try to) remove the file.

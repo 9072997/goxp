@@ -143,6 +143,27 @@ func newFileStatFromFileFullDirInfo(d *windows.FILE_FULL_DIR_INFO) *fileStat {
 	}
 }
 
+// newFileStatFromFileBothDirInformation copies all required information
+// from windows.FILE_BOTH_DIR_INFORMATION d into the newly created fileStat.
+// It fills in exactly what newFileStatFromWin32finddata does, because
+// FindFirstFileW builds WIN32_FIND_DATAW from this same structure.
+func newFileStatFromFileBothDirInformation(d *windows.FILE_BOTH_DIR_INFORMATION) *fileStat {
+	fs := &fileStat{
+		FileAttributes: d.FileAttributes,
+		CreationTime:   d.CreationTime,
+		LastAccessTime: d.LastAccessTime,
+		LastWriteTime:  d.LastWriteTime,
+		FileSizeHigh:   uint32(d.EndOfFile >> 32),
+		FileSizeLow:    uint32(d.EndOfFile),
+	}
+	if d.FileAttributes&syscall.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		// For a reparse point, file systems report the reparse tag in EaSize.
+		// It is where WIN32_FIND_DATAW.dwReserved0 comes from.
+		fs.ReparseTag = d.EaSize
+	}
+	return fs
+}
+
 // newFileStatFromWin32finddata copies all required information
 // from syscall.Win32finddata d into the newly created fileStat.
 func newFileStatFromWin32finddata(d *syscall.Win32finddata) *fileStat {

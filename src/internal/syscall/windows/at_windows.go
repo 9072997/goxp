@@ -487,6 +487,36 @@ func reopenFileHandle(h syscall.Handle, access, share, win32Flags, ntOptions uin
 	return nh, nil
 }
 
+// ReopenDirectoryForListing returns a new handle to the directory h refers to,
+// opened for synchronous I/O with FILE_LIST_DIRECTORY access, which is what
+// NtQueryDirectoryFile needs. It is for a directory opened with
+// FILE_FLAG_OVERLAPPED, on which that call would return STATUS_PENDING. The
+// new handle is reached through h, not by name, so it is the same directory
+// even if its name now leads somewhere else.
+//
+// This is the NtOpenFile half of reopenFileHandle only. ReOpenFile refuses
+// directories: measured on Windows 11, it failed with ERROR_ACCESS_DENIED for
+// every access mask and share mode tried, where the same NtOpenFile succeeded.
+func ReopenDirectoryForListing(h syscall.Handle) (syscall.Handle, error) {
+	objAttrs := &OBJECT_ATTRIBUTES{Attributes: OBJ_CASE_INSENSITIVE}
+	if err := objAttrs.init(h, ""); err != nil {
+		return syscall.InvalidHandle, err
+	}
+	var nh syscall.Handle
+	err := NtOpenFile(
+		&nh,
+		SYNCHRONIZE|FILE_LIST_DIRECTORY,
+		objAttrs,
+		&IO_STATUS_BLOCK{},
+		FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+		FILE_SYNCHRONOUS_IO_NONALERT|FILE_DIRECTORY_FILE|FILE_OPEN_FOR_BACKUP_INTENT,
+	)
+	if err != nil {
+		return syscall.InvalidHandle, ntCreateFileError(err, 0)
+	}
+	return nh, nil
+}
+
 // Native information classes for NtSetInformationFile. These are the classes
 // underlying SetFileInformationByHandle's FileBasicInfo and FileDispositionInfo,
 // and NtSetInformationFile has accepted both since NT 3.1, whereas

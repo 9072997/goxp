@@ -27,16 +27,39 @@ type dirInfo struct {
 	class uint32 // type of entries in buf
 	path  string // absolute directory path, empty if the file system supports FILE_ID_BOTH_DIR_INFO
 
-	// State for the FindFirstFile/FindNextFile fallback, used when
-	// GetFileInformationByHandleEx is missing (Windows XP) or the file system
-	// does not support any directory info class (old SMB shares). The search
-	// has to persist across readdir calls so that a bounded Readdir(n) makes
-	// forward progress instead of restarting from the first entry.
+	// reader is how entries are being read. It starts as
+	// GetFileInformationByHandleEx and moves on only if that cannot be used.
+	reader dirReader
+
+	// State for the NtQueryDirectoryFile reader. See readDirNtQuery.
+	ntHandle   syscall.Handle // handle the query is issued on: h, or a synchronous reopening of it
+	ntReopened bool           // ntHandle is a reopening of h, and closed with the dirInfo
+	ntStarted  bool           // a query has succeeded since the scan was last restarted
+	ntEOF      bool           // the scan is finished
+	ntPos      int            // entries, . and .. excluded, this listing has returned
+	ntSeen     int            // entries, . and .. excluded, the scan has returned since it last restarted
+
+	// State for the FindFirstFile/FindNextFile reader, the last resort. The
+	// search has to persist across readdir calls so that a bounded Readdir(n)
+	// makes forward progress instead of restarting from the first entry.
 	findHandle  syscall.Handle // FindFirstFile handle, 0 if no search is open
 	findData    syscall.Win32finddata
 	findPending bool // findData holds an entry that has not been returned yet
 	findEOF     bool // the search is finished
 }
+
+// dirReader identifies the call File.readdir reads a directory with.
+type dirReader uint8
+
+const (
+	// dirReaderInfoEx is GetFileInformationByHandleEx, Vista and later.
+	dirReaderInfoEx dirReader = iota
+	// dirReaderNtQuery is NtQueryDirectoryFile on the directory's handle.
+	dirReaderNtQuery
+	// dirReaderFindFirstFile is FindFirstFile/FindNextFile on the
+	// directory's name.
+	dirReaderFindFirstFile
+)
 
 const (
 	// dirBufSize is the size of the dirInfo buffer.
@@ -46,6 +69,12 @@ const (
 	// should not be set below 1024 bytes (512+105+safety buffer).
 	// Windows 8.1 and earlier only works with buffer sizes up to 64 kB.
 	dirBufSize = 64 * 1024 // 64kB
+
+	// maxNtQueryBufSize bounds how far readDirNtQuery grows its buffer when a
+	// single entry does not fit. The largest entry a name can produce is the
+	// 94-byte fixed part plus a 65535-byte name, so this is never reached by
+	// a file system that is telling the truth.
+	maxNtQueryBufSize = 1 << 20
 )
 
 var dirBufPool = sync.Pool{
@@ -56,12 +85,20 @@ var dirBufPool = sync.Pool{
 	},
 }
 
-func (d *dirInfo) close() {
-	d.h = 0
+// releaseBuf drops d.buf, returning it to dirBufPool if it came from there.
+func (d *dirInfo) releaseBuf() {
 	if d.buf != nil {
-		dirBufPool.Put(d.buf)
+		if len(*d.buf) == dirBufSize {
+			dirBufPool.Put(d.buf)
+		}
 		d.buf = nil
 	}
+}
+
+func (d *dirInfo) close() {
+	d.h = 0
+	d.releaseBuf()
+	d.closeNtHandle()
 	if d.findHandle != 0 {
 		syscall.FindClose(d.findHandle)
 		d.findHandle = 0
@@ -70,10 +107,27 @@ func (d *dirInfo) close() {
 	d.findEOF = false
 }
 
+func (d *dirInfo) closeNtHandle() {
+	if d.ntReopened {
+		syscall.CloseHandle(d.ntHandle)
+	}
+	d.ntHandle = 0
+	d.ntReopened = false
+}
+
 // allowReadDirFileID indicates whether File.readdir should try to use FILE_ID_BOTH_DIR_INFO
 // if the underlying file system supports it.
 // Useful for testing purposes.
 var allowReadDirFileID = true
+
+// readDirPreVista makes File.readdir behave as it does on a Windows without
+// GetFileInformationByHandleEx and GetVolumeInformationByHandleW, which is to
+// say Windows XP, whatever Windows it is running on. For testing.
+var readDirPreVista = false
+
+// readDirNtQueryBufSize is the size of the buffer readDirNtQuery starts with.
+// Tests shrink it to make entries overflow it.
+var readDirNtQueryBufSize = dirBufSize
 
 func (d *dirInfo) init(h syscall.Handle) {
 	d.h = h
@@ -86,7 +140,10 @@ func (d *dirInfo) init(h syscall.Handle) {
 	// Junctions and symbolic links can reference files and directories in other volumes,
 	// but the reparse point should still live in the parent volume.
 	var flags uint32
-	err := windows.GetVolumeInformationByHandle(h, nil, 0, &d.vol, nil, &flags, nil, 0)
+	var err error = windows.ERROR_NOT_SUPPORTED
+	if !readDirPreVista {
+		err = windows.GetVolumeInformationByHandle(h, nil, 0, &d.vol, nil, &flags, nil, 0)
+	}
 	if err == windows.ERROR_NOT_SUPPORTED {
 		// Pre-Vista: GetVolumeInformationByHandleW does not exist here. Both
 		// things it was asked for are still obtainable. The volume serial is in
@@ -156,6 +213,16 @@ func (file *File) readdir(n int, mode readdirMode) (names []string, dirents []Di
 	if wantAll {
 		n = -1
 	}
+	if readDirPreVista && d.reader == dirReaderInfoEx {
+		d.reader = dirReaderNtQuery
+	}
+	switch d.reader {
+	case dirReaderNtQuery:
+		return readDirNtQuery(file, d, n, wantAll, mode)
+	case dirReaderFindFirstFile:
+		d.releaseBuf()
+		return readDirFindFirstFile(file, n, wantAll, mode)
+	}
 	for n != 0 {
 		// Refill the buffer if necessary
 		if d.bufp == 0 {
@@ -183,12 +250,15 @@ func (file *File) readdir(n int, mode readdirMode) (names []string, dirents []Di
 				}
 				if (err == windows.ERROR_INVALID_PARAMETER || err == windows.ERROR_NOT_SUPPORTED) &&
 					(d.class == windows.FileFullDirectoryRestartInfo || d.class == windows.FileFullDirectoryInfo) {
-					// Even FileFullDirectoryRestartInfo is not supported by very old SMB shares.
-					// This is common with Windows 7 accessing SMB 1.0 shares.
-					// Use FindFirstFile/FindNextFile as the final fallback.
-					dirBufPool.Put(d.buf)
-					d.buf = nil
-					return readDirFindFirstFile(file, n, wantAll, mode)
+					// GetFileInformationByHandleEx is Vista and later, and this
+					// fork's binding reports its absence as ERROR_NOT_SUPPORTED,
+					// so on Windows XP this is the first call's answer. Very old
+					// SMB shares refuse FileFullDirectoryRestartInfo too (common
+					// with Windows 7 accessing SMB 1.0 shares). Either way, read
+					// the directory with the native call instead, from the same
+					// handle.
+					d.reader = dirReaderNtQuery
+					return readDirNtQuery(file, d, n, wantAll, mode)
 				}
 				if s, _ := file.Stat(); s != nil && !s.IsDir() {
 					err = &PathError{Op: "readdir", Path: file.name, Err: syscall.ENOTDIR}
@@ -262,12 +332,187 @@ func (file *File) readdir(n int, mode readdirMode) (names []string, dirents []Di
 	return names, dirents, infos, nil
 }
 
+// readDirNtQuery reads directory entries with NtQueryDirectoryFile and
+// FileBothDirectoryInformation, from the directory's handle.
+//
+// It is used where GetFileInformationByHandleEx is missing (Windows XP) or
+// refuses FileFullDirectoryRestartInfo (very old SMB shares). What matters is
+// that it lists the directory the handle refers to. A reader that resolves the
+// directory again by name, as FindFirstFile does, lists whatever is at that
+// name now: a directory renamed away and replaced by a junction is listed
+// through the junction, even though the handle - and an os.Root holding it -
+// still refers to the original.
+//
+// FileBothDirectoryInformation is the class FindFirstFileW and FindNextFileW
+// are built on, so every file system they could list answers it, and every
+// field WIN32_FIND_DATAW carried comes from the same bytes here: attributes,
+// the three times, the size, and, for a reparse point, the reparse tag in
+// EaSize.
+//
+// The handle's scan position lives in the kernel's file object, so the first
+// query restarts the scan and later ones continue it, and a bounded Readdir(n)
+// makes forward progress across calls. The caller must hold d.mu.
+func readDirNtQuery(file *File, d *dirInfo, n int, wantAll bool, mode readdirMode) (names []string, dirents []DirEntry, infos []FileInfo, err error) {
+	if d.ntHandle == 0 {
+		d.ntHandle = d.h
+		if nonblocking, _ := windows.IsNonblock(d.h); nonblocking {
+			// Opened with FILE_FLAG_OVERLAPPED: a query on this handle would
+			// return STATUS_PENDING and complete on the I/O completion port.
+			// List through a synchronous handle to the same directory instead.
+			h, e := windows.ReopenDirectoryForListing(d.h)
+			runtime.KeepAlive(file)
+			if e != nil {
+				d.ntHandle = 0
+				return nil, nil, nil, &PathError{Op: "readdir", Path: file.name, Err: e}
+			}
+			d.ntHandle = h
+			d.ntReopened = true
+		}
+		if d.buf != nil && len(*d.buf) != readDirNtQueryBufSize {
+			d.releaseBuf()
+			buf := make([]byte, readDirNtQueryBufSize)
+			d.buf = &buf
+		}
+	}
+
+	for n != 0 {
+		// Refill the buffer if necessary
+		if d.bufp == 0 {
+			if d.ntEOF {
+				break
+			}
+			if d.buf == nil {
+				d.buf = dirBufPool.Get().(*[]byte)
+			}
+			restart := !d.ntStarted
+			var iosb windows.IO_STATUS_BLOCK
+			st := windows.NtQueryDirectoryFile(d.ntHandle, 0, 0, 0, &iosb,
+				unsafe.Pointer(&(*d.buf)[0]), uint32(len(*d.buf)),
+				windows.FileBothDirectoryInformation, false, nil, restart)
+			runtime.KeepAlive(file)
+			switch {
+			case st == nil:
+				d.ntStarted = true
+				if iosb.Information == 0 {
+					// Success with nothing in the buffer. Not something a file
+					// system should say, but treating it as the end is the only
+					// answer that cannot loop forever.
+					d.ntEOF = true
+					d.releaseBuf()
+					continue
+				}
+
+			case st == windows.STATUS_NO_MORE_FILES,
+				st == windows.STATUS_NO_SUCH_FILE && restart:
+				// STATUS_NO_SUCH_FILE is what the first query of a directory
+				// with no entries at all returns; a directory normally reports
+				// "." and "..", so this is rare, but it is empty, not an error.
+				d.ntEOF = true
+				d.releaseBuf()
+				continue
+
+			case st == windows.STATUS_BUFFER_OVERFLOW, st == windows.STATUS_INFO_LENGTH_MISMATCH:
+				// Not even one entry fit. The buffer now holds a truncated
+				// entry, and whether the scan has moved past it is up to the
+				// file system. So grow the buffer and restart the scan, and let
+				// the drain loop discard the entries this listing has already
+				// returned. With the 64 kB buffer this takes a name longer than
+				// any file system allows, so in practice it never happens.
+				size := 2 * len(*d.buf)
+				if size > maxNtQueryBufSize {
+					err = &PathError{Op: "NtQueryDirectoryFile", Path: file.name, Err: st.(windows.NTStatus).Errno()}
+					return
+				}
+				d.releaseBuf()
+				buf := make([]byte, size)
+				d.buf = &buf
+				d.ntStarted = false
+				d.ntSeen = 0
+				continue
+
+			default:
+				if s, _ := file.Stat(); s != nil && !s.IsDir() {
+					err = &PathError{Op: "readdir", Path: file.name, Err: syscall.ENOTDIR}
+					return
+				}
+				if restart && d.ntPos == 0 && (st == windows.STATUS_INVALID_INFO_CLASS ||
+					st == windows.STATUS_INVALID_PARAMETER ||
+					st == windows.STATUS_NOT_SUPPORTED ||
+					st == windows.STATUS_NOT_IMPLEMENTED) {
+					// The file system will not list this directory by handle at
+					// all, and nothing has been returned yet. The only reader
+					// left is the one that resolves the directory by name.
+					d.closeNtHandle()
+					d.releaseBuf()
+					d.reader = dirReaderFindFirstFile
+					return readDirFindFirstFile(file, n, wantAll, mode)
+				}
+				e := st
+				if s, ok := st.(windows.NTStatus); ok {
+					e = s.Errno()
+				}
+				err = &PathError{Op: "NtQueryDirectoryFile", Path: file.name, Err: e}
+				return
+			}
+		}
+		// Drain the buffer
+		var islast bool
+		for n != 0 && !islast {
+			entry := (*windows.FILE_BOTH_DIR_INFORMATION)(unsafe.Pointer(&(*d.buf)[d.bufp]))
+			d.bufp += int(entry.NextEntryOffset)
+			islast = entry.NextEntryOffset == 0
+			if islast {
+				d.bufp = 0
+			}
+			nameslice := unsafe.Slice(&entry.FileName[0], entry.FileNameLength/2)
+			if (len(nameslice) == 1 && nameslice[0] == '.') ||
+				(len(nameslice) == 2 && nameslice[0] == '.' && nameslice[1] == '.') {
+				// Ignore "." and ".." and avoid allocating a string for them.
+				// They are not counted in ntSeen and ntPos either, because
+				// they do not come back reliably: measured on NTFS, a buffer
+				// with room for one entry returns "." and then skips "..".
+				continue
+			}
+			d.ntSeen++
+			if d.ntSeen <= d.ntPos {
+				// Returned before the scan was restarted.
+				continue
+			}
+			d.ntPos++
+			name := syscall.UTF16ToString(nameslice)
+			if mode == readdirName {
+				names = append(names, name)
+			} else {
+				f := newFileStatFromFileBothDirInformation(entry)
+				f.name = name
+				f.vol = d.vol
+				if d.path != "" {
+					// Defer appending the entry name to the parent directory
+					// path until it is really needed, as os.SameFile does.
+					f.appendNameToPath = true
+					f.path = d.path
+				}
+				if mode == readdirDirEntry {
+					dirents = append(dirents, dirEntry{f})
+				} else {
+					infos = append(infos, f)
+				}
+			}
+			n--
+		}
+	}
+	if !wantAll && len(names)+len(dirents)+len(infos) == 0 {
+		return nil, nil, nil, io.EOF
+	}
+	return names, dirents, infos, nil
+}
+
 // readDirFindFirstFile reads directory entries with the legacy
 // FindFirstFile/FindNextFile API.
 //
-// It is used on Windows XP, which has no GetFileInformationByHandleEx, and on
-// very old SMB shares that support no directory info class (common with
-// Windows 7 accessing SMB 1.0 shares).
+// It resolves the directory by name rather than by handle, so it is used only
+// where the file system refuses to list the directory by handle at all: see
+// readDirNtQuery.
 //
 // The search handle is kept in dirInfo, so successive calls continue where the
 // previous one stopped. The caller must hold d.mu.

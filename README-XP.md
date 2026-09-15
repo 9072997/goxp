@@ -3,10 +3,11 @@
 Go 1.27.0 that produces binaries Windows XP (NT 5.1) will load and run.
 
     Base:   thongtech/go-legacy-win7 @ 1b73f848   (Go 1.27.0, targets Win7 / PE 6.1)
-    Delta:  59 files, +5628 / -217                (takes it back to XP / PE 5.1)
+    Delta:  63 files, +6548 / -233                (takes it back to XP / PE 5.1)
             + a root-certificate fallback         (see "HTTPS on XP" below)
             + os.Root.RemoveAll restored          (see "os.Root.RemoveAll" below)
             + os.Root made to work at all         (see "os.Root on XP" below)
+            + directories listed by handle        (see "Directory listing on XP" below)
 
 Upstream Go dropped Windows XP after 1.10. `go-legacy-win7` restores Windows 7;
 this restores XP on top of it, which is a further set of problems because Go has
@@ -62,7 +63,7 @@ first `os.ReadDir`. That is exactly what happened to the fork this one replaced.
 | `src/runtime/os_windows.go` | drop 6 Vista+ symbols from `cgo_import_dynamic`; look them up at runtime |
 | `src/runtime/signal_windows.go` | guard `GetErrorMode`, `WerGet/SetFlags`, `RaiseFailFastException` |
 | `src/runtime/netpoll_windows.go` | fall back to the singular `GetQueuedCompletionStatus` |
-| `src/os/dir_windows.go` | stateful `FindFirstFile` directory reader |
+| `src/os/dir_windows.go` | a directory reader that works without `GetFileInformationByHandleEx` |
 | `src/internal/syscall/windows/zsyscall_windows.go` | `.Find()` guards on 5 Vista+ procs |
 | `src/syscall/zsyscall_windows.go` | `.Find()` guards |
 | `src/syscall/exec_windows.go` | plain-`STARTUPINFO` process creation |
@@ -73,10 +74,9 @@ Three of these were not obvious.
 `os/dir_windows.go` went from 80 lines on `FindNextFile` to 230 on
 `GetFileInformationByHandleEx` and `GetVolumeInformationByHandle`, both Vista+.
 `syscall.LazyProc.mustFind` **panics** rather than returning an error, so guards
-alone cannot save it; something has to actually read the directory. The Win7
-fork already carried a `readDirFindFirstFile` for SMB 1.0 shares, but it
-restarted the search on every call, so `Readdir(n>0)` never terminated. On XP
-that stops being a corner case and becomes the only path.
+alone cannot save it; something has to actually read the directory. On XP
+that is `NtQueryDirectoryFile` on the directory's own handle, described under
+"Directory listing on XP".
 
 **`os/exec` was a second, unrelated blocker.** Since Go 1.17 `StartProcess`
 unconditionally uses `InitializeProcThreadAttributeList` and
@@ -226,13 +226,13 @@ reason. An attacker who swaps a directory for a symlink between two steps
 changes nothing: the next `rootOpenDir` on that handle returns `errSymlink`,
 the walk stops descending, and `removedirat` removes the link itself.
 
-The one thing resolved by *path* rather than by handle is the name given to the
-`*File` wrapping each directory handle, which `File.readdir` needs for its
-`FindFirstFile` fallback — the fallback XP takes, since it has no
-`GetFileInformationByHandleEx`. That path is used only to *list* names. If it
-were ever wrong, the names it produced would still be deleted relative to the
-correct parent handle, so the blast radius is a spurious `ENOTEMPTY`, not a
-deletion outside the root.
+The directory listings in the walk are by handle too, XP included (see
+"Directory listing on XP"). The one thing resolved by *path* is the name given
+to the `*File` wrapping each directory handle, and `File.readdir` lists by that
+name only in its last resort, for a file system that refuses to list a
+directory by handle at all. Even then, the names it produced would be deleted
+relative to the correct parent handle, so the blast radius is a spurious
+`ENOTEMPTY`, not a deletion outside the root.
 
 **Edge cases**, matching upstream and pinned by the tests already in
 `root_test.go`: trailing separators are stripped, so `RemoveAll("file/")`
@@ -248,9 +248,9 @@ under "Known unfixed".
 **One correctness fix over upstream's shape.** When `Readdirnames` fails during
 the walk, upstream's `removeAllFrom` returns success if the error satisfies
 `IsNotExist`, on the reasoning that a descriptor reporting its own directory
-gone means the directory is gone. This listing is not descriptor-based: on the
-Windows versions without `GetFileInformationByHandleEx`, `File.readdir` falls
-back to `FindFirstFile`, which resolves the directory *by name*, and a name that
+gone means the directory is gone. This listing is not always handle-based:
+`File.readdir`'s last resort, for a file system that will not list a directory
+by handle, resolves the directory *by name* with `FindFirstFile`, and a name that
 no longer resolves gives `ERROR_PATH_NOT_FOUND` — which `IsNotExist` accepts.
 The same error therefore no longer establishes what upstream reads it as, so
 here it stops the listing and falls through to `removedirat`, which answers the
@@ -451,6 +451,108 @@ opens and XP cannot delete a file that is still open. Eight of those 258 also
 report a real inconsistency, and all eight are the deferred-delete difference
 described above. Nothing else in the suite disagrees between XP and Windows 11.
 
+## Directory listing on XP
+
+`File.readdir` reads a directory from its handle on every Windows version. It
+is what `os.ReadDir`, `File.ReadDir`, `Readdir`, `Readdirnames`, `fs.ReadDir` on
+`os.DirFS` and `Root.FS`, and `Root.RemoveAll`'s walk all list with. Go's own
+reader uses `GetFileInformationByHandleEx`, which is Vista. Where that call is
+missing, or refuses `FileFullDirectoryRestartInfo` as very old SMB shares do,
+this fork calls `NtQueryDirectoryFile` on the same handle. It is an NT 3.1
+system call, and XP's ntdll exports it.
+
+Listing by handle is what keeps an `os.Root` listing inside the root. Take a
+directory opened through a `Root`, rename it away, and put a junction to a
+directory outside the root under its old name. The handle still refers to the
+original, and a listing through it lists the original. A reader that looks the
+directory up again by name lists the outside directory instead, which leaks the
+names, sizes, times and attributes of its entries.
+
+The information class is `FileBothDirectoryInformation`, the one kernel32's
+`FindFirstFileW` and `FindNextFileW` are built on. Any file system those can
+list answers it, and each entry carries exactly what `WIN32_FIND_DATAW`
+carries: attributes, the three times, the size, and for a reparse point the
+reparse tag in `EaSize`. The tag is what makes a junction report as a link
+rather than as a directory.
+
+- The first query restarts the handle's scan and later ones continue it. A
+  bounded `Readdir(n)` keeps its place across calls and ends with `io.EOF`, and
+  a `Seek` back to the start lists again from the beginning.
+- `STATUS_NO_SUCH_FILE` on the first query is an empty directory.
+- If not even one entry fits the 64 kB buffer, the buffer doubles, up to 1 MB,
+  and the scan restarts, skipping the entries already returned. Whether a file
+  system moves past an entry that did not fit is up to the file system, so
+  carrying on without the restart could skip or repeat one.
+- `.` and `..` are skipped, and are not counted when skipping after a restart:
+  NTFS, with a buffer too small for both, returns `.` and never `..`.
+- A directory opened with `FILE_FLAG_OVERLAPPED` would answer the query with
+  `STATUS_PENDING`, so it is listed through a second, synchronous handle, opened
+  by `NtOpenFile` of the empty name relative to the first. That reaches the same
+  directory by handle, not by name. `ReOpenFile` cannot do this: on Windows 11
+  it fails with `ERROR_ACCESS_DENIED` on directories for every access mask and
+  share mode tried. Go's own reader, on Vista and later, blocks forever on such
+  a handle; this fork does not change that.
+- `FindFirstFile`, which resolves the directory by name, is the last resort. It
+  is used only when the file system refuses the first query outright
+  (`STATUS_INVALID_INFO_CLASS`, `STATUS_INVALID_PARAMETER`,
+  `STATUS_NOT_SUPPORTED` or `STATUS_NOT_IMPLEMENTED`) on a handle that is a
+  directory. Local NTFS and FAT do not refuse it.
+
+The directory handles `os` opens already allow the query. `os.Open` goes through
+`CreateFileW` with `GENERIC_READ` and without `FILE_FLAG_OVERLAPPED`, and
+`os.Root` through `NtCreateFile` with `FILE_GENERIC_READ` and
+`FILE_SYNCHRONOUS_IO_NONALERT`. Both grant `FILE_LIST_DIRECTORY` and synchronous
+I/O.
+
+| File | Change |
+|---|---|
+| `src/os/dir_windows.go` | `readDirNtQuery`; the `FindFirstFile` reader as the last resort |
+| `src/os/types_windows.go` | `newFileStatFromFileBothDirInformation` |
+| `src/internal/syscall/windows/syscall_windows.go` | `NtQueryDirectoryFile`, `FILE_BOTH_DIR_INFORMATION`, six status codes |
+| `src/internal/syscall/windows/zsyscall_windows.go` | the `NtQueryDirectoryFile` binding, with a `.Find()` guard |
+| `src/internal/syscall/windows/at_windows.go` | `ReopenDirectoryForListing` |
+| `src/os/root_removeall_windows.go` | comments |
+| `src/os/dir_windows_test.go` | the tests below |
+
+`FILE_BOTH_DIR_INFORMATION`'s `ShortNameLength` is one byte, so `FileName` is at
+offset 94; `TestFileBothDirInformationLayout` pins that. The tests in
+`os/dir_windows_test.go` run each case twice on any Windows: once as the
+machine is, and once with `readDirPreVista` forcing the XP reader, so the build
+host tests the XP path too.
+
+- `TestRootReadDirAfterJunctionSwap`: the swap above, through `Open` listed four
+  ways and through a sub-root's `Open(".")` and `FS`.
+- `TestReadDirByHandleFields`: every field of every entry against `Lstat`,
+  including a junction, a read-only file, a non-ASCII name and a 200-character
+  name.
+- `TestReadDirByHandlePaging`: pages of 1, 3, 5 and 100, past the end, after a
+  `Seek`, and with a 128-byte buffer so that entries overflow it mid-listing.
+- `TestReadDirByHandleOverlapped` and `TestReadDirByHandleOddCases`: an
+  overlapped handle, an empty directory, a regular file (`ENOTDIR`), and the
+  named-pipe file system.
+
+### Verified on hardware
+
+Windows XP 5.1.2600 SP3, 2026-09-15, cross-compiled `windows/386`.
+
+`osroot-probe` reports 91 passed, 0 failed. Both swap cases list the original
+directory: `R01` lists `inside-only.txt`, and `R04`, through a sub-root, lists
+`planted.txt,secret.txt`, the original's entries rather than the outside
+directory's `secret.txt,sub`. `R02` and `R03`, which read and write through the
+swapped sub-root, pass. A directory reached by a 365-character path, past
+`MAX_PATH`, lists correctly.
+
+The `os` test binary, run from a copy of `src/os` with
+
+    os.test.exe -test.v -test.run "^(TestRootReadDirAfterJunctionSwap|TestReadDirByHandle.*|TestRootJunctionContainment|TestReadDir.*|TestReaddir.*|TestFileReadDir|TestFileReaddir.*|TestDirFS.*|TestRootDirFS|TestRootRemoveAll.*|TestRemoveAll.*|TestRootOpen_Directory|TestSameFile)$"
+
+passes every test it runs. The 42 skips are symlink fixtures XP cannot build and
+tests that do not apply to Windows. `TestFileReadDir`, which compares each
+entry of a listing with `Lstat` by `os.SameFile`, passes.
+`TestReadDirByHandleFields` does not compare its 200-character name that way,
+for the reason given under "Known unfixed"; it compares that entry's identity
+with the same entry from a second listing instead.
+
 ## Known unfixed
 
 - `CancelIoEx` has no XP equivalent, and this is the root of most of what
@@ -469,6 +571,13 @@ described above. Nothing else in the suite disagrees between XP and Windows 11.
   then waits at an error dialog. So starting a corrupt `.exe` returns no error
   and the resulting process never exits, where 64-bit Windows fails cleanly
   with `ERROR_BAD_EXE_FORMAT`.
+- `os.SameFile` reports false when either argument came from `os.Stat` or
+  `os.Lstat` of a path of 248 characters or more, in a process that is not
+  long-path aware, which on XP is every process. `stat` saves the path as
+  given, and `fileStat.loadFileId` opens it without `fixLongPath` to read the
+  file's identity, so the open fails. Upstream Go has the same code. A
+  `FileInfo` from a directory listing is not affected: its path is joined and
+  extended before the open.
 - Symbolic links cannot be created with `os.Symlink` or followed by anything but
   `os.Root`, and deleting or renaming over a file that is still open is deferred
   rather than immediate. Both are detailed under "os.Root on XP".
@@ -495,4 +604,5 @@ over TLS. On XP this is the path every HTTPS connection takes, so it is measured
 there rather than believed.
 
 `os.Root` was brought up on that hardware on 2026-08-31, junction and all; see
-"os.Root on XP" for what was measured and what still differs.
+"os.Root on XP" for what was measured and what still differs. Directory listing
+by handle was verified there on 2026-09-15; see "Directory listing on XP".
