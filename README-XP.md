@@ -711,7 +711,18 @@ Not measured on hardware:
   `TestReadWriteMsgUDPAddrPortEmptyCmsg` fail on XP for this reason.
 - `TestInterfacesWithNetsh`, `TestInterfaceAddrsWithNetsh` and
   `TestInterfaceHardwareAddrWithGetmac` run `netsh` and `getmac` through
-  PowerShell, which XP does not have, and fail there.
+  PowerShell, which a stock XP does not have, and fail there. PowerShell is
+  only the pipe: each command runs as `powershell -Command "<cmd> | Out-File
+  <tmp> -encoding UTF8"`, which PowerShell 2.0 can do. With .NET 2.0 SP2 and
+  PowerShell 2.0 installed on an XP SP3 VM (2026-09-15, this tree),
+  `TestInterfaceHardwareAddrWithGetmac` passes: XP's `getmac /fo list /v`
+  prints the format the test parses, and Go's hardware address matches it. The
+  two netsh tests still fail, and no XP setup changes that. They ask for
+  `netsh interface ipv4 ...` with `level=verbose`, a Vista context and option
+  that XP's netsh answers with "The following command was not found" (XP
+  spells it `interface ip`). They also query IPv6 first, which that VM
+  reported as not installed. Passing on XP would need the tests to speak XP's
+  netsh, not a different environment.
 - `Cmd.WaitDelay` does not bound `Wait` when a grandchild inherits the child's
   output pipe. WaitDelay works by abandoning the pending read, which is the one
   thing XP cannot do, so `Wait` blocks until the grandchild exits on its own.
